@@ -48,15 +48,15 @@
     <!-- 连接数 -->
     <Border Grid.Row="2" Background="#FF23272F" CornerRadius="6" Padding="14" Margin="0,0,0,12">
       <StackPanel>
-        <TextBlock Text="单文件连接数" Foreground="#FFD8DEE9"/>
+        <TextBlock Text="全局下载连接数" Foreground="#FFD8DEE9"/>
         <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-          <Slider x:Name="SliderConnections" Minimum="8" Maximum="48" Value="24"
+          <Slider x:Name="SliderConnections" Minimum="8" Maximum="256" Value="64"
                   Width="280" IsSnapToTickEnabled="True" TickFrequency="8"/>
-          <TextBlock x:Name="TxtConnections" Text="24" Foreground="#FFECEFF4"
+          <TextBlock x:Name="TxtConnections" Text="64" Foreground="#FFECEFF4"
                      Margin="12,0,0,0" VerticalAlignment="Center" FontWeight="Bold"/>
         </StackPanel>
         <TextBlock FontSize="11" Foreground="#FF8891A4" Margin="0,6,0,0"
-                   Text="PCL CE 硬上限是 8；24 是实测较优值。过高可能被 CDN 限流。"/>
+                   Text="PCL CE 默认 16，所有文件共享这个上限。64 是较优值；太高可能被 CDN 限流。"/>
       </StackPanel>
     </Border>
 

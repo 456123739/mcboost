@@ -156,14 +156,14 @@ public partial class MainWindow : Window
             WorkingDirectory = Path.GetDirectoryName(exe)!,
         };
         psi.Environment["DOTNET_STARTUP_HOOKS"] = hook;
-        psi.Environment["MCBOOST_PCL_CONNECTIONS"] = ((int)SliderConnections.Value).ToString();
+        psi.Environment["MCBOOST_PCL_THREADS"] = ((int)SliderConnections.Value).ToString();
 
         try
         {
             Process.Start(psi);
             Append($"已带钩子启动: {Path.GetFileName(exe)}");
             Append($"  DOTNET_STARTUP_HOOKS = {hook}");
-            Append($"  目标连接数 = {(int)SliderConnections.Value}");
+            Append($"  目标全局连接数 = {(int)SliderConnections.Value}");
             Append("");
             Append("等 PCL CE 主界面出来后，会自动检测结果…");
             TxtStatus.Text = "已启动，等待钩子生效…";
