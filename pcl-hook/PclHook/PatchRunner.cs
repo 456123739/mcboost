@@ -45,7 +45,7 @@ namespace McBoost.PclHook
 
             while (DateTime.UtcNow < deadline)
             {
-                downloaderType = FindType("PCL.Network.Downloader.AdaptiveRangeDownloader");
+                downloaderType = FindType("PCL.Network.AdaptiveRangeDownloader");
                 if (downloaderType != null) break;
 
                 // 每 ~3 秒记一次，避免日志刷屏
@@ -66,9 +66,23 @@ namespace McBoost.PclHook
 
             Diag.Log($"found type: {downloaderType.FullName} in {downloaderType.Assembly.GetName().Name}");
 
-            var downloadAsync = downloaderType.GetMethod(
-                "DownloadAsync",
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            MethodInfo? downloadAsync;
+            try
+            {
+                downloadAsync = downloaderType.GetMethod(
+                    "DownloadAsync",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            }
+            catch (AmbiguousMatchException)
+            {
+                // 有重载时挑参数最多的那个
+                downloadAsync = downloaderType
+                    .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    .Where(m => m.Name == "DownloadAsync")
+                    .OrderByDescending(m => m.GetParameters().Length)
+                    .FirstOrDefault();
+                Diag.Log("DownloadAsync 存在重载，已选参数最多的一个");
+            }
 
             if (downloadAsync == null)
             {
@@ -190,22 +204,98 @@ namespace McBoost.PclHook
                 if (!IsConst(third, 8)) continue;
                 if (!ReadsConnectionLimit(first)) continue;
 
-                third.operand = TargetConnections;
+                SetConst(third, TargetConnections);
                 replaced++;
             }
 
             if (replaced > 0)
+            {
                 Diag.Log($"transpiler: 替换 {replaced} 处 Clamp 上界 -> {TargetConnections}");
+            }
             else
-                Diag.Log("transpiler: 未匹配到 Clamp(x,1,8) 模式（IL 可能已变）");
+            {
+                Diag.Log("transpiler: 未匹配到 Clamp(x,1,8) 模式，转储实际 IL 以便排查");
+                DumpClampContext(list);
+            }
 
             return list;
         }
 
+        /// <summary>
+        /// 把 Clamp 调用附近的 IL 打到日志里。
+        /// transpiler 没匹配上时用 —— 这样不必再靠猜，能直接看到真实指令序列。
+        /// </summary>
+        private static void DumpClampContext(List<CodeInstruction> list)
+        {
+            try
+            {
+                var found = 0;
+                for (var i = 0; i < list.Count && found < 3; i++)
+                {
+                    if (!IsClampCall(list[i])) continue;
+                    found++;
+
+                    var from = Math.Max(0, i - 6);
+                    var to = Math.Min(list.Count - 1, i + 1);
+                    var sb = new System.Text.StringBuilder();
+                    sb.Append($"Clamp@{i}: ");
+                    for (var k = from; k <= to; k++)
+                    {
+                        var ins = list[k];
+                        var operand = ins.operand == null ? "" : $" {ins.operand}";
+                        sb.Append($"[{k}]{(k == i ? "*" : "")}{ins.opcode.Name}{operand}  ");
+                    }
+                    Diag.Log(sb.ToString());
+                }
+                if (found == 0) Diag.Log("未在该方法中找到任何 Math.Clamp 调用");
+            }
+            catch (Exception ex)
+            {
+                Diag.Log("dump IL 失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 判断指令是否为指定整数常量。
+        ///
+        /// 必须处理三种编码方式，否则永远匹配不到：
+        ///   · -1..8 用专用指令 <c>Ldc_I4_M1</c> / <c>Ldc_I4_0</c> … <c>Ldc_I4_8</c>，
+        ///     **没有 operand**（C# 编译 1 和 8 就属于这种）
+        ///   · -128..127 用 <c>Ldc_I4_S</c>，operand 是 <b>sbyte</b> 而非 int
+        ///   · 其它用 <c>Ldc_I4</c>，operand 是 int
+        /// </summary>
         private static bool IsConst(CodeInstruction ins, int value)
         {
-            if (ins.opcode != OpCodes.Ldc_I4 && ins.opcode != OpCodes.Ldc_I4_S) return false;
-            return ins.operand is int v && v == value;
+            if (ins.opcode == OpCodes.Ldc_I4_M1) return value == -1;
+            if (ins.opcode == OpCodes.Ldc_I4_0) return value == 0;
+            if (ins.opcode == OpCodes.Ldc_I4_1) return value == 1;
+            if (ins.opcode == OpCodes.Ldc_I4_2) return value == 2;
+            if (ins.opcode == OpCodes.Ldc_I4_3) return value == 3;
+            if (ins.opcode == OpCodes.Ldc_I4_4) return value == 4;
+            if (ins.opcode == OpCodes.Ldc_I4_5) return value == 5;
+            if (ins.opcode == OpCodes.Ldc_I4_6) return value == 6;
+            if (ins.opcode == OpCodes.Ldc_I4_7) return value == 7;
+            if (ins.opcode == OpCodes.Ldc_I4_8) return value == 8;
+            if (ins.opcode == OpCodes.Ldc_I4_S) return ins.operand is sbyte sb && sb == value;
+            if (ins.opcode == OpCodes.Ldc_I4) return ins.operand is int v && v == value;
+            return false;
+        }
+
+        /// <summary>
+        /// 把一条指令改写为指定整数常量（opcode 与 operand 一起改）。
+        /// </summary>
+        private static void SetConst(CodeInstruction ins, int value)
+        {
+            if (value >= -128 && value <= 127)
+            {
+                ins.opcode = OpCodes.Ldc_I4_S;
+                ins.operand = (sbyte)value;
+            }
+            else
+            {
+                ins.opcode = OpCodes.Ldc_I4;
+                ins.operand = value;
+            }
         }
 
         private static bool IsClampCall(CodeInstruction ins)
@@ -225,25 +315,76 @@ namespace McBoost.PclHook
             return m.Name.Contains("NetTaskSingleFileConnectionLimit");
         }
 
+        /// <summary>
+        /// 在所有已加载程序集中按全名或短名查找类型。
+        ///
+        /// 关键点：<c>Assembly.GetTypes()</c> 只要有一个类型加载失败就会抛
+        /// <see cref="ReflectionTypeLoadException"/>，但异常的 <c>Types</c> 属性里
+        /// **保留了成功加载的部分**。早期版本遇到异常直接跳过整个程序集，
+        /// 而 PCL CE 主程序集恰恰会因为缺少可选依赖而抛异常 ——
+        /// 结果就是永远找不到目标类型。这里必须用部分结果继续找。
+        /// </summary>
         private static Type? FindType(string fullName)
         {
             var direct = Type.GetType(fullName);
             if (direct != null) return direct;
 
             var shortName = fullName.Split('.').Last();
+            var failedAssemblies = new List<string>();
+            var totalTypes = 0;
 
             foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
             {
-                Type[] types;
-                try { types = asm.GetTypes(); }
-                catch (ReflectionTypeLoadException) { continue; }
-                catch { continue; }
+                Type?[] types;
+                try
+                {
+                    types = asm.GetTypes();
+                }
+                catch (ReflectionTypeLoadException ex)
+                {
+                    // 保留能加载的那部分
+                    types = ex.Types;
+                    failedAssemblies.Add(asm.GetName().Name ?? "?");
+                }
+                catch (Exception)
+                {
+                    failedAssemblies.Add(asm.GetName().Name ?? "?");
+                    continue;
+                }
 
-                var exact = types.FirstOrDefault(t => t.FullName == fullName);
+                totalTypes += types.Length;
+
+                var exact = types.FirstOrDefault(t => t != null && t.FullName == fullName);
                 if (exact != null) return exact;
 
-                var byShort = types.FirstOrDefault(t => t.Name == shortName);
-                if (byShort != null) return byShort;
+                var byShort = types.FirstOrDefault(t => t != null && t.Name == shortName);
+                if (byShort != null)
+                {
+                    Diag.Log($"按短名命中: {byShort.FullName}（在 {asm.GetName().Name}）");
+                    return byShort;
+                }
+            }
+
+            Diag.Log($"FindType({fullName}) 未命中。扫描 {totalTypes} 个类型，" +
+                     $"部分加载失败的程序集({failedAssemblies.Count}): " +
+                     string.Join(", ", failedAssemblies.Take(8)));
+
+            // 最后兜底：按关键字模糊找，便于诊断真实类型名
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type?[] types;
+                try { types = asm.GetTypes(); }
+                catch (ReflectionTypeLoadException ex) { types = ex.Types; }
+                catch { continue; }
+
+                var near = types.Where(t => t != null &&
+                        (t.Name.Contains("AdaptiveRange") || t.Name.Contains("RangeDownload")))
+                    .Select(t => t!.FullName).Take(5).ToList();
+                if (near.Count > 0)
+                {
+                    Diag.Log("相近类型: " + string.Join(", ", near));
+                    break;
+                }
             }
             return null;
         }
