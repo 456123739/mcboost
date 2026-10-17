@@ -15,6 +15,8 @@ on:
         description: '默认单文件连接数'
         required: false
         default: '24'
+  release:
+    types: [published]
 
 jobs:
   build:
@@ -82,3 +84,24 @@ jobs:
           path: publish/
           if-no-files-found: error
           retention-days: 30
+
+      # ---- 发布到 Release（仅在 release 事件或手动指定时执行）----
+      - name: 附加到 Release
+        if: github.event_name == 'release'
+        shell: pwsh
+        run: |
+          $files = @(
+            "publish/PclHookInjector.exe",
+            "publish/PclHook.dll",
+            "publish/0Harmony.dll",
+            "publish/PclHook.deps.json",
+            "publish/使用说明.txt"
+          )
+          foreach ($f in $files) {
+            if (Test-Path $f) {
+              Write-Host "上传 $f"
+              gh release upload "${{ github.event.release.tag_name }}" $f --repo "${{ github.repository }}" --clobber
+            }
+          }
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
