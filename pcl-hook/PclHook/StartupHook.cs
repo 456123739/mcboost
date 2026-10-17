@@ -27,7 +27,7 @@ using System.Threading;
 public static class StartupHook
 {
     /// <summary>钩子版本。</summary>
-    public const string HookVersion = "3.4.0";
+    public const string HookVersion = "3.5.0";
 
     /// <summary>运行时自动调用的入口。第一行就写日志，确保能证明钩子被加载过。</summary>
     public static void Initialize()

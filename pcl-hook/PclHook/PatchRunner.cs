@@ -2,136 +2,202 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Reflection.Emit;
 using System.Threading;
 using HarmonyLib;
 
 namespace McBoost.PclHook
 {
     /// <summary>
-    /// 补丁执行器（针对老版 PCL2 / PCL CE 下载引擎）。
+    /// 补丁执行器 —— 针对 PCL CE 2.15.1 的实际下载实现。
     ///
-    /// 依据用户实测诊断报告确定：
-    ///   PCL.Network.ModNet 的静态属性 NetTaskThreadLimit = 16
-    ///   且存在 PCL.ModSetup.ToolDownloadThread（对应旧版设置项）
-    ///   → 这是老版 PCL2 的下载引擎，没有 AdaptiveRangeDownloader
-    ///
-    /// 老引擎的关键限制（来自官方 PCL2 的 ModNet.vb）：
+    /// 依据：拉取 v2.15.1-beta.1 tag 源码确认，该版本**没有** AdaptiveRangeDownloader，
+    /// 下载走 PCL.Network.FileDownloader + Downloader NuGet 包。关键代码：
     /// <code>
-    /// Public ReadOnly Property NetTaskThreadLimit As Integer
-    ///     Get
-    ///         Return Settings.Get(Of Integer)("ToolDownloadThread") + 1
-    ///     End Get
-    /// End Property
-    ///
-    /// ' TryBeginThread 里：
-    /// If NetTaskThreadCount >= NetTaskThreadLimit ... Then Return Nothing
+    /// // FileDownloader.DownloadSingleAsync
+    /// var perFileThreadLimit = enableParallelChunks ? Math.Max(1, ModNet.NetTaskThreadLimit) : 1;
+    /// var chunkCount = Math.Min(perFileThreadLimit, 4);   // ← 每文件最多 4 个分片
+    /// var configuration = new DownloadConfiguration {
+    ///     ChunkCount = chunkCount,
+    ///     ParallelCount = chunkCount,
+    ///     ParallelDownload = chunkCount > 1,
+    ///     MinimumSizeOfChunking = 1024 * 1024L,          // 小于 1MB 不分片
+    ///     ...
+    /// };
     /// </code>
-    /// NetTaskThreadCount 是模块级字段 —— 也就是说这是**全局**连接上限，
-    /// 整合包一次下 100 多个文件时，全部挤在这十几条连接里。
     ///
-    /// 补法：给 getter 挂 Postfix，把返回值抬到目标值。
-    /// 不依赖 IL 结构、不依赖是否可写，最稳。
+    /// 所以真正的瓶颈是那个写死的 <c>4</c>：无论把 NetTaskThreadLimit 调到多少，
+    /// Math.Min 都会把它压回 4，**每个文件只有 4 条连接**。
+    ///
+    /// 本补丁做两件事：
+    ///   1. 把 ModNet.NetTaskThreadLimit 直接设高（它是普通可写静态属性）
+    ///      这样 Math.Min 的输入不会成为新的瓶颈
+    ///   2. 用 Transpiler 把 DownloadSingleAsync 里 Math.Min(?, 4) 的 4 换成目标分片数
+    ///      只改这一个常量，其余逻辑（分块、断点、进度、重试）全部沿用 PCL 自己的
     /// </summary>
     internal static class PatchRunner
     {
-        /// <summary>目标全局连接上限。</summary>
-        internal static int TargetThreads =
-            ReadIntFromEnv("MCBOOST_PCL_THREADS") ?? 64;
+        /// <summary>目标每文件分片（连接）数。4 是原版上限。</summary>
+        internal static int TargetChunks =
+            ReadIntFromEnv("MCBOOST_PCL_CHUNKS") ?? 8;
 
-        /// <summary>原始值（补丁前读到的），仅用于日志对比。</summary>
-        private static int _originalLimit = -1;
+        /// <summary>原版硬编码的分片上限。</summary>
+        private const int OriginalChunkCap = 4;
 
         private const int MaxWaitSeconds = 60;
 
         internal static void RunUntilApplied()
         {
-            Diag.Log($"patcher start (v3.4, 老引擎模式), target threads = {TargetThreads}");
+            Diag.Log($"patcher start (v3.5, 目标每文件 {TargetChunks} 分片)");
 
             var modNet = WaitForType("PCL.Network.ModNet");
-            if (modNet == null)
+            if (modNet != null) RaiseThreadLimit(modNet);
+            else Diag.Log("WARN: 找不到 PCL.Network.ModNet（不影响分片补丁）");
+
+            var downloader = WaitForType("PCL.Network.FileDownloader");
+            if (downloader == null)
             {
-                Diag.Log("FAIL: 找不到 PCL.Network.ModNet，无法定位连接上限");
+                Diag.Log("FAIL: 找不到 PCL.Network.FileDownloader，无法定位分片上限");
                 return;
             }
 
-            var prop = modNet.GetProperty("NetTaskThreadLimit",
-                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            var target = downloader.GetMethod("DownloadSingleAsync",
+                BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
 
-            if (prop == null)
+            if (target == null)
             {
-                Diag.Log("FAIL: ModNet 上找不到 NetTaskThreadLimit 属性");
-                DumpModNetMembers(modNet);
-                return;
-            }
-
-            // 记录原始值
-            try { _originalLimit = Convert.ToInt32(prop.GetValue(null)); }
-            catch { _originalLimit = -1; }
-            Diag.Log($"原始 NetTaskThreadLimit = {_originalLimit}");
-
-            // 1. 若可写，直接设一次（覆盖走字段的路径）
-            if (prop.CanWrite)
-            {
-                try
-                {
-                    prop.SetValue(null, TargetThreads);
-                    Diag.Log($"已直接设置 NetTaskThreadLimit = {TargetThreads}");
-                }
-                catch (Exception ex)
-                {
-                    Diag.Log($"直接设置失败（预期，可能是只读计算属性）: {ex.Message}");
-                }
-            }
-
-            // 2. 关键：给 getter 挂 Postfix
-            //    只读计算属性每次都重新读设置项，所以必须改 getter 返回值。
-            var getter = prop.GetGetMethod(nonPublic: true);
-            if (getter == null)
-            {
-                Diag.Log("FAIL: 取不到 NetTaskThreadLimit 的 getter");
+                Diag.Log("FAIL: 找不到 FileDownloader.DownloadSingleAsync");
+                Diag.Log("现有方法: " + string.Join(", ",
+                    downloader.GetMethods(BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public)
+                        .Select(m => m.Name).Distinct()));
                 return;
             }
 
             var harmony = new Harmony("com.mcboost.pclhook");
-            var postfix = new HarmonyMethod(
-                typeof(PatchRunner).GetMethod(nameof(ThreadLimitPostfix),
+            var transpiler = new HarmonyMethod(
+                typeof(PatchRunner).GetMethod(nameof(Transpile),
                     BindingFlags.Static | BindingFlags.Public)!);
 
             try
             {
-                harmony.Patch(getter, postfix: postfix);
-                // 验证
-                var now = Convert.ToInt32(prop.GetValue(null));
-                if (now >= TargetThreads)
-                {
-                    Diag.Log($"DONE: NetTaskThreadLimit 已从 {_originalLimit} 提升到 {now}");
-                    Diag.Log("现在 PCL 的全局下载连接上限已提高，重新开始下载整合包即可生效。");
-                }
-                else
-                {
-                    Diag.Log($"WARN: patch 后读取仍为 {now}（期望 >= {TargetThreads}），可能属性缓存了值");
-                }
+                harmony.Patch(target, transpiler: transpiler);
+                Diag.Log($"DONE: 已 patch FileDownloader.DownloadSingleAsync，分片上限 {OriginalChunkCap} -> {TargetChunks}");
+                Diag.Log("现在重新开始下载整合包即可生效（每个文件最多开 " + TargetChunks + " 条连接）。");
             }
             catch (Exception ex)
             {
-                Diag.Log($"FAIL: patch getter 失败: {ex.GetType().Name}: {ex.Message}");
-                DumpModNetMembers(modNet);
+                Diag.Log($"FAIL: patch 失败: {ex.GetType().Name}: {ex.Message}");
             }
         }
 
         /// <summary>
-        /// 把 NetTaskThreadLimit 的返回值抬到目标值。
-        /// 取 max(原值, 目标值)，绝不降低原有配置。
+        /// 抬高 ModNet.NetTaskThreadLimit。
+        /// v2.15.1 里它是 <c>public static int NetTaskThreadLimit { get; set; } = 16;</c>
+        /// 普通可写属性，直接赋值即可。
+        /// 设成 分片数 × 4，保证 Math.Min 的输入不成为新瓶颈。
         /// </summary>
-        public static void ThreadLimitPostfix(ref int __result)
+        private static void RaiseThreadLimit(Type modNet)
         {
-            if (__result < TargetThreads)
+            try
             {
-                __result = TargetThreads;
+                var prop = modNet.GetProperty("NetTaskThreadLimit",
+                    BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                if (prop == null)
+                {
+                    Diag.Log("WARN: ModNet 上没有 NetTaskThreadLimit");
+                    return;
+                }
+
+                var before = prop.GetValue(null);
+                var want = Math.Max(TargetChunks * 4, 64);
+                prop.SetValue(null, want);
+                var after = prop.GetValue(null);
+                Diag.Log($"NetTaskThreadLimit: {before} -> {after}");
+            }
+            catch (Exception ex)
+            {
+                Diag.Log("WARN: 设置 NetTaskThreadLimit 失败: " + ex.Message);
             }
         }
 
-        /// <summary>等待某个类型出现（PCL 程序集可能晚于钩子加载）。</summary>
+        /// <summary>
+        /// 把 <c>Math.Min(x, 4)</c> 的上界 4 换成目标值。
+        ///
+        /// 该写法位于 DownloadSingleAsync 中：
+        ///   ldc.i4.4 ; call Math::Min(int32,int32)
+        /// 只匹配「前一指令是常量 4、且当前是 Math.Min」这一处，
+        /// 不会碰同方法里 MinimumSizeOfChunking 等其它常量。
+        /// </summary>
+        public static IEnumerable<CodeInstruction> Transpile(IEnumerable<CodeInstruction> instructions)
+        {
+            var list = instructions.ToList();
+            var replaced = 0;
+
+            for (var i = 1; i < list.Count; i++)
+            {
+                if (!IsMathCall(list[i], "Min")) continue;
+                if (!IsConst(list[i - 1], OriginalChunkCap)) continue;
+
+                SetConst(list[i - 1], TargetChunks);
+                replaced++;
+            }
+
+            if (replaced > 0)
+                Diag.Log($"transpiler: 已替换 {replaced} 处 Math.Min(?, {OriginalChunkCap}) -> {TargetChunks}");
+            else
+                Diag.Log("transpiler: 未匹配到 Math.Min(?, 4)，IL 结构可能变化");
+
+            return list;
+        }
+
+        /// <summary>
+        /// 判断是否为指定整数常量。
+        ///
+        /// 小常量用专用 opcode，没有 operand：
+        ///   -1 → Ldc_I4_M1，0..8 → Ldc_I4_0 … Ldc_I4_8
+        /// -128..127 用 Ldc_I4_S，operand 是 <b>sbyte</b>
+        /// 其它用 Ldc_I4，operand 是 int
+        /// </summary>
+        private static bool IsConst(CodeInstruction ins, int value)
+        {
+            if (ins.opcode == OpCodes.Ldc_I4_M1) return value == -1;
+            if (ins.opcode == OpCodes.Ldc_I4_0) return value == 0;
+            if (ins.opcode == OpCodes.Ldc_I4_1) return value == 1;
+            if (ins.opcode == OpCodes.Ldc_I4_2) return value == 2;
+            if (ins.opcode == OpCodes.Ldc_I4_3) return value == 3;
+            if (ins.opcode == OpCodes.Ldc_I4_4) return value == 4;
+            if (ins.opcode == OpCodes.Ldc_I4_5) return value == 5;
+            if (ins.opcode == OpCodes.Ldc_I4_6) return value == 6;
+            if (ins.opcode == OpCodes.Ldc_I4_7) return value == 7;
+            if (ins.opcode == OpCodes.Ldc_I4_8) return value == 8;
+            if (ins.opcode == OpCodes.Ldc_I4_S) return ins.operand is sbyte sb && sb == value;
+            if (ins.opcode == OpCodes.Ldc_I4) return ins.operand is int v && v == value;
+            return false;
+        }
+
+        /// <summary>改写一条指令为指定整数常量（opcode 与 operand 一起改）。</summary>
+        private static void SetConst(CodeInstruction ins, int value)
+        {
+            if (value >= -128 && value <= 127)
+            {
+                ins.opcode = OpCodes.Ldc_I4_S;
+                ins.operand = (sbyte)value;
+            }
+            else
+            {
+                ins.opcode = OpCodes.Ldc_I4;
+                ins.operand = value;
+            }
+        }
+
+        private static bool IsMathCall(CodeInstruction ins, string methodName)
+        {
+            if (ins.opcode != OpCodes.Call && ins.opcode != OpCodes.Callvirt) return false;
+            if (ins.operand is not MethodInfo m) return false;
+            return m.Name == methodName && m.DeclaringType != null
+                   && (m.DeclaringType.FullName == "System.Math" || m.DeclaringType.Name == "Math");
+        }
+
         private static Type? WaitForType(string fullName)
         {
             var deadline = DateTime.UtcNow.AddSeconds(MaxWaitSeconds);
@@ -144,11 +210,6 @@ namespace McBoost.PclHook
             return null;
         }
 
-        /// <summary>
-        /// 在所有已加载程序集里找类型。
-        /// 必须用 ReflectionTypeLoadException.Types 的部分结果 ——
-        /// PCL 主程序集常因缺可选依赖抛这个异常，直接 skip 会漏掉目标类型。
-        /// </summary>
         private static Type? FindType(string fullName)
         {
             var direct = Type.GetType(fullName);
@@ -170,30 +231,6 @@ namespace McBoost.PclHook
                 if (byShort != null) return byShort;
             }
             return null;
-        }
-
-        /// <summary>属性找不到时，把 ModNet 的成员列进日志，便于定位。</summary>
-        private static void DumpModNetMembers(Type modNet)
-        {
-            try
-            {
-                Diag.Log("--- ModNet 成员 ---");
-                foreach (var p in modNet.GetProperties(BindingFlags.Static
-                             | BindingFlags.Public | BindingFlags.NonPublic))
-                {
-                    Diag.Log($"  prop {p.Name} : {p.PropertyType.Name} (writable={p.CanWrite})");
-                }
-                foreach (var f in modNet.GetFields(BindingFlags.Static
-                             | BindingFlags.Public | BindingFlags.NonPublic))
-                {
-                    Diag.Log($"  field {f.Name} : {f.FieldType.Name}");
-                }
-                Diag.Log("-------------------");
-            }
-            catch (Exception ex)
-            {
-                Diag.Log("列成员失败: " + ex.Message);
-            }
         }
 
         private static int? ReadIntFromEnv(string name)
