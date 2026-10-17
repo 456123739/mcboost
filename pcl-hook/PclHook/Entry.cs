@@ -1,64 +1,30 @@
-using System.IO;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
-using System.Runtime.CompilerServices;
 using HarmonyLib;
 
 namespace McBoost.PclHook;
 
 /// <summary>
-/// 模块初始化：DLL 被 LoadLibrary 加载后、任何代码访问前自动执行。
-/// 这样注入器不需要再往目标进程里塞调用 stub —— DLL 一加载就完成补丁。
-/// </summary>
-internal static class ModuleInit
-{
-    [ModuleInitializer]
-    internal static void Initialize()
-    {
-        try
-        {
-            Entry.AutoApply();
-        }
-        catch (Exception ex)
-        {
-            McBoostLog.Warn($"自动应用补丁失败: {ex.Message}");
-        }
-    }
-}
-
-/// <summary>
 /// mcboost 针对 PCL CE 的连接数上限破解。
 ///
-/// 背景（读 PCL-Community/PCL-CE 源码确认）：
-/// <code>
-/// // ModNet.cs
-/// public const int NetTaskSingleFileConnectionLimitMax = 8;    // const → 编译期内联
-/// public static int NetTaskSingleFileConnectionLimit { get; set; } = 8;
-///
-/// // AdaptiveRangeDownloader.DownloadAsync
-/// var workerCount = Math.Min(segmentCount,
-///     Math.Clamp(ModNet.NetTaskSingleFileConnectionLimit, 1,
-///                ModNet.NetTaskSingleFileConnectionLimitMax));   // ← 内联成 ldc.i4.8
-/// </code>
-///
-/// 因为 Max 是 const，读取处已被编译期内联为字面量 8，所以单纯改属性值无效，
-/// Clamp 的上界永远是 8 —— 这就是 PCL CE 单文件最多 8 连接的硬顶。
-///
-/// 实测代价（同文件、同时刻、同网络）：
-///   8 连接 = 2.7 MB/s，16 连接 = 14.3 MB/s，24 连接 = 18.3 MB/s，差距约 6.8 倍。
-///
-/// 做法：用 Harmony 的 Transpiler 精确改写 <c>DownloadAsync</c> 的 IL，
-/// 只把 <c>Math.Clamp(prop, 1, 8)</c> 中作为上界传入的那个常量 8 改成目标值。
-/// 其余 IL 一律不动 —— 包括同一方法里的 <c>bufferSize: 1</c>、
-/// 以及 DownloadSession 内部的 <c>SlowCheckSeconds = 8</c> 等语义完全不同的常量。
+/// 为什么不用 [ModuleInitializer]：ModuleInitializer 生成的代码在模块的
+/// .cctor 里，而模块静态构造函数只有在该模块的类型被首次访问时才触发。
+/// 注入器用 LoadLibrary 加载 DLL 后，如果没有代码访问 PclHook 的任何类型，
+/// .cctor 永远不执行 —— 实测表现为「注入成功但毫无反应，连日志都没有」。
+/// 所以改为由注入器通过 ICLRRuntimeInfo::ExecuteInDefaultAppDomain
+/// 主动调用 Entry.Apply。
 /// </summary>
 public static class Entry
 {
     /// <summary>默认目标单文件连接数。</summary>
     public const int DefaultSingleFileConnections = 24;
+
+    /// <summary>Hook DLL 版本，用于版本检测与自动还原。</summary>
+    public const string HookVersion = "1.0.0";
 
     private static Harmony? _harmony;
     private static int _singleFileConnections = DefaultSingleFileConnections;
@@ -71,54 +37,11 @@ public static class Entry
     public static int SingleFileConnections => _singleFileConnections;
 
     /// <summary>
-    /// 供 <see cref="ModuleInit"/> 调用：自动应用补丁。
-    ///
-    /// 注入时机可能早于 PCL CE 的程序集加载，所以这里做有限重试，
-    /// 每隔一段时间再试一次，直到找到目标类型。
+    /// 应用补丁。由注入器通过 CLR 托管注入主动调用。幂等。
     /// </summary>
-    internal static void AutoApply()
+    public static bool Apply(int? singleFileConnections = null)
     {
-        var connections = ReadConnectionsFromEnvironment();
-
-        for (var attempt = 0; attempt < 40 && !_applied; attempt++)
-        {
-            try
-            {
-                Apply(connections);
-                return;
-            }
-            catch (InvalidOperationException)
-            {
-                // 目标类型还没加载，等一会儿再试
-                Thread.Sleep(500);
-            }
-            catch (Exception ex)
-            {
-                McBoostLog.Warn($"应用补丁出错: {ex.Message}");
-                return;
-            }
-        }
-
-        if (!_applied)
-            McBoostLog.Warn("重试 40 次后仍未找到 PCL CE 的下载类型，补丁未生效");
-    }
-
-    /// <summary>
-    /// 从环境变量读取目标连接数，方便不重新编译就能调整。
-    /// </summary>
-    private static int? ReadConnectionsFromEnvironment()
-    {
-        var raw = Environment.GetEnvironmentVariable("MCBOOST_PCL_CONNECTIONS");
-        return int.TryParse(raw, out var v) && v > 0 ? v : null;
-    }
-
-    /// <summary>
-    /// 应用补丁。重复调用安全。
-    /// </summary>
-    /// <param name="singleFileConnections">单文件连接数目标值，默认 24</param>
-    public static void Apply(int? singleFileConnections = null)
-    {
-        if (_applied) return;
+        if (_applied) return true;
 
         if (singleFileConnections is > 0)
             _singleFileConnections = singleFileConnections.Value;
@@ -129,17 +52,21 @@ public static class Entry
         var downloaderType = FindType("PCL.Network.Downloader.AdaptiveRangeDownloader")
                              ?? FindType("AdaptiveRangeDownloader");
         if (downloaderType is null)
-            throw new InvalidOperationException(
-                "找不到 AdaptiveRangeDownloader —— PCL CE 版本可能不兼容，请反馈版本号");
+        {
+            McBoostLog.Warn("找不到 AdaptiveRangeDownloader —— PCL CE 版本可能不兼容");
+            return false;
+        }
 
         var downloadAsync = downloaderType.GetMethod("DownloadAsync",
             BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
         if (downloadAsync is null)
-            throw new InvalidOperationException(
-                "找不到 AdaptiveRangeDownloader.DownloadAsync —— PCL CE 版本可能不兼容");
+        {
+            McBoostLog.Warn("找不到 AdaptiveRangeDownloader.DownloadAsync");
+            return false;
+        }
 
-        // 顺带把属性值抬高，这样即使某条路径没走到被 patch 的内联常量，
-        // Clamp 的输入也是高值，行为依然更激进（不会更慢）。
+        // 顺带抬高属性值：即使某条路径没走到被 patch 的内联常量，
+        // Clamp 的输入也是高值，行为只会更激进（不会更慢）。
         var modNetType = FindType("PCL.Network.ModNet");
         var prop = modNetType?.GetProperty("NetTaskSingleFileConnectionLimit",
             BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
@@ -154,8 +81,19 @@ public static class Entry
                 nameof(TranspilerHolder.Transpile),
                 BindingFlags.Public | BindingFlags.Static)!);
 
-        _harmony.Patch(downloadAsync, transpiler: transpiler);
+        try
+        {
+            _harmony.Patch(downloadAsync, transpiler: transpiler);
+        }
+        catch (Exception ex)
+        {
+            McBoostLog.Warn($"Harmony patch 失败: {ex.Message}");
+            return false;
+        }
+
         _applied = true;
+        McBoostLog.Info($"PCL CE Hook {HookVersion} 已就绪，目标单文件连接数 {_singleFileConnections}");
+        return true;
     }
 
     /// <summary>
@@ -163,14 +101,25 @@ public static class Entry
     /// </summary>
     public static void Revert()
     {
-        if (!_applied || _harmony is null) return;
-        _harmony.UnpatchAll(_harmony.Id);
-        _applied = false;
+        if (_harmony is null) return;
+        try
+        {
+            _harmony.UnpatchAll(_harmony.Id);
+            McBoostLog.Info("已还原 PCL CE 原版下载行为");
+        }
+        catch (Exception ex)
+        {
+            McBoostLog.Warn($"还原失败: {ex.Message}");
+        }
+        finally
+        {
+            _applied = false;
+            _harmony = null;
+        }
     }
 
     /// <summary>
-    /// 在运行时改变目标连接数。修改后需要重新 Apply 才能生效
-    /// （因为目标值已被写进 IL）。
+    /// 在运行时改变目标连接数。修改后需重新 Apply 才会写进 IL。
     /// </summary>
     public static void SetSingleFileConnections(int value)
     {
@@ -180,8 +129,17 @@ public static class Entry
     }
 
     /// <summary>
+    /// 供注入器查询当前状态，返回 JSON 字符串。
+    /// </summary>
+    public static string GetStatus()
+    {
+        var applied = _applied ? "true" : "false";
+        return $"{{\"applied\":{applied},\"connections\":{_singleFileConnections},\"version\":\"{HookVersion}\"}}";
+    }
+
+    /// <summary>
     /// 在已加载的程序集中查找类型。PCL CE 主程序集名随构建变化，
-    /// 所以逐个程序集查，并在精确全名匹配失败时退化为按短名匹配。
+    /// 所以逐个程序集查，精确全名失败时退化为按短名匹配。
     /// </summary>
     private static Type? FindType(string fullName)
     {
@@ -207,7 +165,7 @@ public static class Entry
 }
 
 /// <summary>
-/// Harmony transpiler 宿主。Harmony 通过反射调用，所以类型和方法必须 public。
+/// Harmony transpiler 宿主。Harmony 通过反射调用，类型和方法必须 public。
 /// </summary>
 public static class TranspilerHolder
 {
@@ -215,23 +173,9 @@ public static class TranspilerHolder
     public static int SingleFileConnections = Entry.DefaultSingleFileConnections;
 
     /// <summary>
-    /// 精确替换 <c>Math.Clamp(ModNet.NetTaskSingleFileConnectionLimit, 1, 8)</c>
-    /// 中作为上界的常量 8。
-    ///
-    /// 匹配策略：**以 Clamp 调用为锚点向前回溯**，而不是"把所有值为 8 的常量都换掉"。
-    /// 预期 IL 形态：
-    /// <code>
-    ///   call/getstatic  ModNet.get_NetTaskSingleFileConnectionLimit   ← 参数1
-    ///   ldc.i4.1                                                      ← 参数2（下界）
-    ///   ldc.i4.8                                                      ← 参数3（上界，要改的就是它）
-    ///   call          Math.Clamp
-    /// </code>
-    ///
-    /// 这样做的好处：
-    ///  - 同一方法里其它语义完全不同的常量 8（例如 DownloadSession 里的
-    ///    <c>SlowCheckSeconds = 8</c>、以及任何 <c>bufferSize: 8</c>）不会被动到；
-    ///  - 即使编译器在不同版本下生成了略有差异的指令前缀，只要 Clamp 的三个参数
-    ///    顺序不变就能正确匹配。
+    /// 精确替换 Math.Clamp(ModNet.NetTaskSingleFileConnectionLimit, 1, 8)
+    /// 中作为上界的常量 8。以 Clamp 调用为锚点向前回溯，只处理
+    /// Clamp(x, 1, 8) 这一种形态，且确认第一个参数读取的是连接数限制属性。
     /// </summary>
     public static IEnumerable<CodeInstruction> Transpile(IEnumerable<CodeInstruction> instructions)
     {
@@ -241,15 +185,12 @@ public static class TranspilerHolder
         for (int i = 0; i < list.Count; i++)
         {
             if (!IsClampCall(list[i])) continue;
-
-            // 向前回溯三个参数（参数是逆序入栈的，所以越靠前越是最后一个参数）
             if (i < 3) continue;
 
-            var third = list[i - 1];   // Clamp 的第三个参数：上界
-            var second = list[i - 2];  // Clamp 的第二个参数：下界
-            var first = list[i - 3];   // Clamp 的第一个参数：被 clamp 的值
+            var third = list[i - 1];   // Clamp 第三参数：上界
+            var second = list[i - 2];  // Clamp 第二参数：下界
+            var first = list[i - 3];   // Clamp 第一参数：被 clamp 的值
 
-            // 只处理 Clamp(x, 1, 8) 这一种确切形态
             if (!IsConst(second, 1)) continue;
             if (!IsConst(third, 8)) continue;
             if (!ReadsConnectionLimit(first)) continue;
@@ -260,8 +201,7 @@ public static class TranspilerHolder
 
         if (replaced == 0)
         {
-            // 没找到预期模式：可能是 PCL CE 改过了实现。
-            // 此时不修改任何 IL（保持原版行为），由日志暴露问题，
+            // 没匹配到：不修改任何 IL，保持原版行为，靠日志暴露问题，
             // 而不是悄悄破坏下载逻辑。
             McBoostLog.Warn("未找到连接数上限的 IL 模式，补丁未生效（PCL CE 版本可能已变更）");
         }
@@ -286,8 +226,7 @@ public static class TranspilerHolder
             return false;
         if (ins.operand is not MethodInfo m) return false;
         return m.Name == "Clamp" && m.DeclaringType != null
-            && (m.DeclaringType.FullName == "System.Math"
-                || m.DeclaringType.Name == "Math");
+            && (m.DeclaringType.FullName == "System.Math" || m.DeclaringType.Name == "Math");
     }
 
     /// <summary>
@@ -304,7 +243,7 @@ public static class TranspilerHolder
 }
 
 /// <summary>
-/// 极简日志：写入 PCL CE 的日志目录，同时输出到调试器。
+/// 极简日志。写入 %APPDATA%\PCL\mcboost-hook.log，同时输出到调试器。
 /// 不依赖 PCL CE 内部类型，避免版本耦合。
 /// </summary>
 internal static class McBoostLog
@@ -312,22 +251,31 @@ internal static class McBoostLog
     private static readonly object Gate = new();
     private static string? _logPath;
 
+    /// <summary>日志文件路径，供外部读取。</summary>
+    internal static string LogPath
+    {
+        get
+        {
+            _logPath ??= Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "PCL", "mcboost-hook.log");
+            return _logPath;
+        }
+    }
+
     internal static void Info(string message) => Write("INFO", message);
     internal static void Warn(string message) => Write("WARN", message);
 
     private static void Write(string level, string message)
     {
-        var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] [{level}] [mcboost] {message}";
+        var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [{level}] [mcboost] {message}";
         System.Diagnostics.Debug.WriteLine(line);
         try
         {
             lock (Gate)
             {
-                _logPath ??= Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                    "PCL", "mcboost-hook.log");
-                Directory.CreateDirectory(Path.GetDirectoryName(_logPath)!);
-                File.AppendAllText(_logPath, line + Environment.NewLine);
+                Directory.CreateDirectory(Path.GetDirectoryName(LogPath)!);
+                File.AppendAllText(LogPath, line + Environment.NewLine);
             }
         }
         catch

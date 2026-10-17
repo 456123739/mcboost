@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>McBoostGui</AssemblyName>
+    <RootNamespace>McBoost.PclHook.Gui</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <ApplicationTitle>mcboost PCL CE 加速</ApplicationTitle>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Injector\PclHookInjector.csproj" />
+  </ItemGroup>
+
+</Project>

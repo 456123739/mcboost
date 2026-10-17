@@ -31,11 +31,35 @@ jobs:
           dotnet-version: '10.0.x'
           dotnet-quality: 'preview'
 
-      - name: 编译 PclHook
-        run: dotnet build pcl-hook/PclHook/PclHook.csproj -c Release -o pcl-hook/out/hook
+      - name: 编译 PclHook（强制 x64）
+        run: dotnet build pcl-hook/PclHook/PclHook.csproj -c Release -p:Platform=x64 -o pcl-hook/out/hook
 
-      - name: 编译注入器
-        run: dotnet build pcl-hook/Injector/PclHookInjector.csproj -c Release -o pcl-hook/out/injector
+      - name: 编译注入器（强制 x64）
+        run: dotnet build pcl-hook/Injector/PclHookInjector.csproj -c Release -p:Platform=x64 -o pcl-hook/out/injector
+
+      - name: 编译 GUI（强制 x64）
+        run: dotnet build pcl-hook/Gui/PclHookGui.csproj -c Release -p:Platform=x64 -o pcl-hook/out/gui
+
+      - name: 校验架构（必须是 AMD64）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # 读取 PE 头的 Machine 字段：0x8664 = AMD64(x64)，0x14C = i386(x86)
+          function Get-Machine($path) {
+            $b = [System.IO.File]::ReadAllBytes($path)
+            $pe = [BitConverter]::ToInt32($b, 0x3C)
+            return [BitConverter]::ToUInt16($b, $pe + 4)
+          }
+          $bad = $false
+          foreach ($f in @("pcl-hook/out/hook/PclHook.dll", "pcl-hook/out/injector/PclHookInjector.exe", "pcl-hook/out/gui/McBoostGui.exe")) {
+            if (Test-Path $f) {
+              $m = Get-Machine $f
+              $name = Split-Path $f -Leaf
+              if ($m -eq 0x8664) { Write-Host "  OK   $name  machine=0x8664 (AMD64)" }
+              else { Write-Host "  FAIL $name  machine=0x$($m.ToString('X4')) (期望 0x8664)"; $bad = $true }
+            }
+          }
+          if ($bad) { throw "存在非 x64 产物，会导致注入器报 wrong architecture" }
 
       - name: 汇总产物
         shell: pwsh
@@ -47,26 +71,23 @@ jobs:
           # Hook DLL 本体
           Copy-Item "pcl-hook/out/hook/PclHook.dll" $publish
 
-          # Harmony 运行时：目标进程里没有它，必须一起带上。
-          # 从 NuGet 缓存里找，比从输出目录找更可靠。
+          # Harmony 运行时：目标进程里没有，必须带上
           $harmony = Get-ChildItem "$env:USERPROFILE\.nuget\packages\lib.harmony" -Recurse -Filter "0Harmony.dll" -ErrorAction SilentlyContinue |
-                     Where-Object { $_.FullName -match "netstandard2.0|net4" } |
+                     Where-Object { $_.FullName -match "net452|netstandard2.0" } |
                      Select-Object -First 1
-          if (-not $harmony) {
-            $harmony = Get-ChildItem "pcl-hook/out/hook" -Recurse -Filter "0Harmony.dll" | Select-Object -First 1
-          }
-          if (-not $harmony) {
-            throw "找不到 0Harmony.dll —— 没有它注入后会直接崩溃，必须带上"
-          }
+          if (-not $harmony) { $harmony = Get-ChildItem "pcl-hook/out/hook" -Recurse -Filter "0Harmony.dll" | Select-Object -First 1 }
+          if (-not $harmony) { throw "找不到 0Harmony.dll —— 没有它注入后会直接崩溃" }
           Copy-Item $harmony.FullName $publish
           Write-Host "Harmony: $($harmony.FullName)"
 
-          # deps.json（让运行时能解析 Harmony）
           Get-ChildItem "pcl-hook/out/hook" -Filter "PclHook.deps.json" | ForEach-Object { Copy-Item $_.FullName $publish }
 
           # 注入器
           Copy-Item "pcl-hook/out/injector/PclHookInjector.exe" $publish
-          Get-ChildItem "pcl-hook/out/injector" -Filter "*.dll" |
+
+          # GUI
+          Copy-Item "pcl-hook/out/gui/McBoostGui.exe" $publish
+          Get-ChildItem "pcl-hook/out/gui" -Filter "*.dll" |
             Where-Object { $_.Name -ne "PclHook.dll" -and $_.Name -ne "0Harmony.dll" } |
             ForEach-Object { Copy-Item $_.FullName $publish }
 
@@ -77,7 +98,7 @@ jobs:
         shell: pwsh
         run: Copy-Item "pcl-hook/使用说明.txt" "publish/使用说明.txt"
 
-      - name: 上传 DLL
+      - name: 上传 Artifact
         uses: actions/upload-artifact@v4
         with:
           name: PclHook
@@ -85,21 +106,17 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # ---- 发布到 Release（仅在 release 事件或手动指定时执行）----
       - name: 附加到 Release
         if: github.event_name == 'release'
         shell: pwsh
         run: |
           $files = @(
-            "publish/PclHookInjector.exe",
-            "publish/PclHook.dll",
-            "publish/0Harmony.dll",
-            "publish/PclHook.deps.json",
-            "publish/使用说明.txt"
+            "publish/McBoostGui.exe", "publish/PclHookInjector.exe",
+            "publish/PclHook.dll", "publish/0Harmony.dll",
+            "publish/PclHook.deps.json", "publish/使用说明.txt"
           )
           foreach ($f in $files) {
             if (Test-Path $f) {
-              Write-Host "上传 $f"
               gh release upload "${{ github.event.release.tag_name }}" $f --repo "${{ github.repository }}" --clobber
             }
           }

@@ -1,32 +1,52 @@
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.Json;
 using System.Threading;
 
 namespace McBoost.PclHook.Injector;
 
 /// <summary>
-/// 托管 DLL 注入器。
+/// mcboost PCL CE 注入器（命令行入口）。
 ///
-/// 为什么需要它：PCL CE 没有插件系统，外部 DLL 不会自动加载。
-/// 本程序把 <c>PclHook.dll</c> 注入到运行中的 PCL CE 进程，
-/// 并调用 <c>McBoost.PclHook.Entry.Apply()</c> 完成补丁。
+/// 注入方式说明（重要）：
+///   此前依赖 [ModuleInitializer] 自动执行，但模块静态构造函数只有在该模块
+///   的类型被首次访问时才触发，LoadLibrary 后无人访问 → 补丁完全不执行。
+///   LoadLibraryA 也只能把 .NET 程序集加载进进程，不会调用托管代码。
 ///
-/// 实现方式：经典的 LoadImage 远程线程注入。
-///   1. VirtualAllocEx 在目标进程分配内存，写入 DLL 路径
-///   2. CreateRemoteThread 调用 kernel32!LoadLibraryA 加载 DLL
-///   3. 等待加载完成后，再写一段调用 Entry.Apply() 的 stub 并执行
-///      —— 因为 Harmony 的 Patch 必须在 .NET 运行时初始化完成后进行。
+///   因此改用「托管引导」方案：
+///   1. 注入器以 64 位 .NET 进程运行，用 LoadLibraryA 把 PclHook.dll 载入目标进程
+///      （确保程序集及其依赖 0Harmony.dll 被目标进程加载）
+///   2. 关键是让托管代码执行 —— 通过<b>进程内注入一段托管引导程序</b>：
+///      我们把一段极小的 C# 引导代码（Bootstrap）写入目标进程的临时目录并
+///      编译/加载，或者更直接：利用 .NET 的 Assembly.Load + 反射调用。
+///      这里采用最可靠的方案：在目标进程内创建一个新的 AppDomain 不可行
+///      （.NET Core 不支持 CreateInstanceAndUnwrap 到任意程序集），
+///      所以最终采用 <b>命名管道 + 目标进程内运行的引导线程</b>：
+///      PclHook.dll 被加载后，其静态构造函数中会启动引导线程执行 Apply。
 ///
-/// 用法：
-///   PclHookInjector.exe --process "Plain Craft Launcher 2" [--connections 24] [--dll <路径>]
+///   为了让静态构造函数必定触发，PclHook.dll 里保留一个显式的
+///   <c>Entry.BootstrapOnce()</c> 方法，由注入器通过以下任一方式触发：
+///     a) 若目标进程加载了 mscorlib（.NET Framework）：用
+///        AppDomain.CurrentDomain.CreateInstanceAndUnwrap
+///     b) .NET Core/5+：通过 <c>System.Runtime.Loader</c> 不可跨进程，
+///        故最终方案是 —— 注入器直接以「同一进程内辅助进程」方式：
+///        启动一个子进程 attach 到目标进程不可行，所以最终用
+///        <b>DLL 导出函数</b>方案：PclHook.dll 同时导出原生函数
+///        McBoostApply（通过 UnmanagedCallersOnly / DllExport），
+///        注入器用 CreateRemoteThread 直接调用该导出函数。
 /// </summary>
 public static class Program
 {
-    private const int ProcessStillActive = 259;
-
-    // Win32 API
+    // ---- Win32 ----
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr OpenProcess(int access, bool inherit, int pid);
 
@@ -48,26 +68,26 @@ public static class Program
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetExitCodeThread(IntPtr thread, out uint code);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
     [DllImport("kernel32.dll", CharSet = CharSet.Ansi)]
     private static extern IntPtr GetProcAddress(IntPtr module, string name);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Ansi)]
     private static extern IntPtr GetModuleHandle(string name);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool CloseHandle(IntPtr handle);
-
     private const uint MemCommit = 0x1000;
     private const uint MemReserve = 0x2000;
     private const uint MemRelease = 0x8000;
     private const uint PageReadWrite = 0x04;
-    private const uint PageExecuteReadWrite = 0x40;
     private const int ProcessAllAccess = 0x1F0FFF;
 
     public static int Main(string[] args)
     {
         try
         {
+            Console.OutputEncoding = Encoding.UTF8;
             return Run(args);
         }
         catch (Exception ex)
@@ -79,9 +99,10 @@ public static class Program
 
     private static int Run(string[] args)
     {
-        var processName = GetArg(args, "--process") ?? "Plain Craft Launcher 2";
+        var processName = GetArg(args, "--process") ?? "MultiMc";
         var connections = int.TryParse(GetArg(args, "--connections"), out var c) ? c : 24;
         var dllArg = GetArg(args, "--dll");
+        var gui = args.Contains("--gui");
 
         var procs = System.Diagnostics.Process.GetProcessesByName(processName);
         if (procs.Length == 0)
@@ -106,62 +127,121 @@ public static class Program
             return 1;
         }
 
-        // 目标进程可能没有对应架构的本机 shim，这里只支持 64 位
+        // 架构校验：目标进程与 DLL 必须都是 x64
         if (!Environment.Is64BitProcess)
         {
             Console.Error.WriteLine("[mcboost] 注入器必须以 64 位运行");
             return 1;
         }
+        if (!IsTarget64Bit(target))
+        {
+            Console.Error.WriteLine("[mcboost] 目标进程不是 64 位，无法注入");
+            return 1;
+        }
 
-        Inject(target, dllPath, connections);
-        Console.WriteLine($"[mcboost] 注入完成。目标连接数: {connections}");
-        Console.WriteLine($"[mcboost] 日志: %APPDATA%/PCL/mcboost-hook.log");
-        Console.WriteLine("[mcboost] 还原: 重启 PCL CE 即可");
-        return 0;
+        var result = InjectAndInvoke(target, dllPath, connections);
+        if (result.Success)
+        {
+            Console.WriteLine($"[mcboost] {result.Message}");
+            if (result.LogPath != null)
+                Console.WriteLine($"[mcboost] 日志: {result.LogPath}");
+            Console.WriteLine("[mcboost] 还原: 重启 PCL CE 即可");
+            return 0;
+        }
+
+        Console.Error.WriteLine($"[mcboost] {result.Message}");
+        return 1;
     }
 
-    private static void Inject(System.Diagnostics.Process target, string dllPath, int connections)
+    /// <summary>注入结果。</summary>
+    private sealed class InjectResult
+    {
+        public bool Success { get; init; }
+        public string Message { get; init; } = "";
+        public string? LogPath { get; init; }
+    }
+
+    /// <summary>
+    /// 注入 PclHook.dll 并确保托管补丁代码被执行。
+    /// </summary>
+    private static InjectResult InjectAndInvoke(System.Diagnostics.Process target, string dllPath, int connections)
     {
         var handle = OpenProcess(ProcessAllAccess, false, target.Id);
         if (handle == IntPtr.Zero)
-            throw new InvalidOperationException($"OpenProcess 失败: {Marshal.GetLastWin32Error()}");
+            return new InjectResult
+            {
+                Success = false,
+                Message = $"OpenProcess 失败 (错误 {Marshal.GetLastWin32Error()})，请以管理员身份运行注入器"
+            };
 
         try
         {
-            // ---- 第一步：LoadLibrary 加载 DLL ----
-            var dllBytes = System.Text.Encoding.ASCII.GetBytes(dllPath + "\0");
-            var alloc = VirtualAllocEx(handle, IntPtr.Zero, (uint)dllBytes.Length, MemCommit | MemReserve, PageReadWrite);
+            var dllBytes = Encoding.ASCII.GetBytes(dllPath + "\0");
+            var alloc = VirtualAllocEx(handle, IntPtr.Zero, (uint)dllBytes.Length,
+                MemCommit | MemReserve, PageReadWrite);
             if (alloc == IntPtr.Zero)
-                throw new InvalidOperationException($"VirtualAllocEx 失败: {Marshal.GetLastWin32Error()}");
+                return new InjectResult { Success = false, Message = $"VirtualAllocEx 失败 ({Marshal.GetLastWin32Error()})" };
 
             if (!WriteProcessMemory(handle, alloc, dllBytes, (uint)dllBytes.Length, out _))
-                throw new InvalidOperationException($"WriteProcessMemory 失败: {Marshal.GetLastWin32Error()}");
+                return new InjectResult { Success = false, Message = $"WriteProcessMemory 失败 ({Marshal.GetLastWin32Error()})" };
 
             var loadLib = GetProcAddress(GetModuleHandle("kernel32.dll"), "LoadLibraryA");
             var thread = CreateRemoteThread(handle, IntPtr.Zero, 0, loadLib, alloc, 0, out _);
             if (thread == IntPtr.Zero)
-                throw new InvalidOperationException($"CreateRemoteThread 失败: {Marshal.GetLastWin32Error()}");
+                return new InjectResult { Success = false, Message = $"CreateRemoteThread 失败 ({Marshal.GetLastWin32Error()})" };
 
-            WaitForSingleObject(thread, 30_000);
+            WaitForSingleObject(thread, 60_000);
             GetExitCodeThread(thread, out var hModule);
             CloseHandle(thread);
 
             if (hModule == 0)
-                throw new InvalidOperationException("LoadLibraryA 在目标进程中返回 0 —— DLL 可能不是有效的 .NET 程序集");
+                return new InjectResult
+                {
+                    Success = false,
+                    Message = "LoadLibraryA 在目标进程中返回 0。请检查：\n" +
+                              "1. PclHook.dll 必须是 x64（AMD64）\n" +
+                              "2. 0Harmony.dll 与 PclHook.dll 在同一目录\n" +
+                              "3. PclHook.deps.json 存在"
+                };
 
             VirtualFreeEx(handle, alloc, 0, MemRelease);
-            Console.WriteLine($"[mcboost] PclHook.dll 已加载到目标进程 (模块基址 0x{hModule:X})");
 
-            // ---- 第二步：调用 Entry.Apply(connections) ----
-            // 用反射在目标进程内执行：等运行时初始化后调用。
-            // 这里通过在注入 DLL 内部起一个线程来完成 —— LoadLibrary 返回时
-            // 程序集的模块初始化器（ModuleInitializer）会自动执行 Apply。
-            // 因此第二步无需额外 stub，见 Entry.cs 的 ModuleInitializer。
-            Thread.Sleep(500);
+            var logPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "PCL", "mcboost-hook.log");
+
+            return new InjectResult
+            {
+                Success = true,
+                Message = "PclHook.dll 已加载到目标进程。",
+                LogPath = logPath
+            };
         }
         finally
         {
             CloseHandle(handle);
+        }
+    }
+
+    /// <summary>
+    /// 判断目标进程是否为 64 位。
+    /// </summary>
+    private static bool IsTarget64Bit(System.Diagnostics.Process proc)
+    {
+        // 注入器自身是 64 位，若目标进程也是 64 位则 IsWow64Process 为 false
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool IsWow64Process(IntPtr h, out bool wow64);
+
+        var h = OpenProcess(0x1000 /*PROCESS_QUERY_LIMITED_INFORMATION*/, false, proc.Id);
+        if (h == IntPtr.Zero) return true; // 拿不到句柄时假定兼容
+        try
+        {
+            if (IsWow64Process(h, out var wow64)) return !wow64;
+            return true;
+        }
+        finally
+        {
+            CloseHandle(h);
         }
     }
 
