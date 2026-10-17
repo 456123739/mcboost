@@ -1,4 +1,4 @@
-name: 构建 PCL CE Hook DLL
+name: 构建 PCL CE 加速
 
 on:
   push:
@@ -6,15 +6,7 @@ on:
     paths:
       - 'pcl-hook/**'
       - '.github/workflows/build.yml'
-  pull_request:
-    paths:
-      - 'pcl-hook/**'
   workflow_dispatch:
-    inputs:
-      connections:
-        description: '默认单文件连接数'
-        required: false
-        default: '24'
   release:
     types: [published]
 
@@ -31,110 +23,73 @@ jobs:
           dotnet-version: '10.0.x'
           dotnet-quality: 'preview'
 
-      - name: 编译 PclHook（强制 x64）
+      - name: 编译钩子 DLL
         run: dotnet build pcl-hook/PclHook/PclHook.csproj -c Release -p:Platform=x64 -o pcl-hook/out/hook
 
-      - name: 编译注入器（强制 x64）
-        run: dotnet build pcl-hook/Injector/PclHookInjector.csproj -c Release -p:Platform=x64 -o pcl-hook/out/injector
+      - name: 编译启动器
+        run: dotnet build pcl-hook/Launcher/McBoostLauncher.csproj -c Release -p:Platform=x64 -o pcl-hook/out/launcher
 
-      - name: 编译 GUI（强制 x64）
-        run: dotnet build pcl-hook/Gui/PclHookGui.csproj -c Release -p:Platform=x64 -o pcl-hook/out/gui
-
-      - name: 校验架构（必须是 AMD64）
+      - name: 校验 StartupHook 契约
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          # 读取 PE 头的 Machine 字段：0x8664 = AMD64(x64)，0x14C = i386(x86)
-          function Get-Machine($path) {
-            $b = [System.IO.File]::ReadAllBytes($path)
-            $pe = [BitConverter]::ToInt32($b, 0x3C)
-            return [BitConverter]::ToUInt16($b, $pe + 4)
-          }
-          $bad = $false
-          foreach ($f in @("pcl-hook/out/hook/PclHook.dll", "pcl-hook/out/injector/PclHookInjector.exe", "pcl-hook/out/gui/McBoostGui.exe")) {
-            if (Test-Path $f) {
-              $m = Get-Machine $f
-              $name = Split-Path $f -Leaf
-              if ($m -eq 0x8664) { Write-Host "  OK   $name  machine=0x8664 (AMD64)" }
-              else { Write-Host "  FAIL $name  machine=0x$($m.ToString('X4')) (期望 0x8664)"; $bad = $true }
-            }
-          }
-          if ($bad) { throw "存在非 x64 产物，会导致注入器报 wrong architecture" }
+          $dll = "pcl-hook/out/hook/PclHook.dll"
+          if (-not (Test-Path $dll)) { throw "缺少 PclHook.dll" }
 
-      - name: 汇总产物
+          # 用反射加载，确认 StartupHook 类型存在于全局命名空间且有 Initialize()
+          $asm = [System.Reflection.Assembly]::LoadFrom((Resolve-Path $dll))
+          $hook = $asm.GetType("StartupHook")
+          if ($hook -eq $null) { throw "找不到全局命名空间的 StartupHook 类型 —— 启动钩子不会生效" }
+          $init = $hook.GetMethod("Initialize", [System.Reflection.BindingFlags]::Public -bor [System.Reflection.BindingFlags]::Static)
+          if ($init -eq $null) { throw "StartupHook 缺少 public static void Initialize()" }
+          if ($init.GetParameters().Length -ne 0) { throw "Initialize 不能有参数" }
+          Write-Host "  OK   StartupHook.Initialize() 契约通过（全局命名空间）"
+
+          # 架构校验
+          $b = [System.IO.File]::ReadAllBytes((Resolve-Path $dll))
+          $pe = [BitConverter]::ToInt32($b, 0x3C)
+          $machine = [BitConverter]::ToUInt16($b, $pe + 4)
+          if ($machine -ne 0x8664) { throw "PclHook.dll 不是 x64 (machine=0x$($machine.ToString('X4')))" }
+          Write-Host "  OK   PclHook.dll machine=0x8664 (AMD64)"
+
+      - name: 打包
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $publish = "publish"
-          New-Item -ItemType Directory -Force -Path $publish | Out-Null
-
-          # Hook DLL 本体
-          Copy-Item "pcl-hook/out/hook/PclHook.dll" $publish
-
-          # Harmony 运行时：目标进程里没有，必须带上
-          $harmony = Get-ChildItem "$env:USERPROFILE\.nuget\packages\lib.harmony" -Recurse -Filter "0Harmony.dll" -ErrorAction SilentlyContinue |
-                     Where-Object { $_.FullName -match "net452|netstandard2.0" } |
-                     Select-Object -First 1
-          if (-not $harmony) { $harmony = Get-ChildItem "pcl-hook/out/hook" -Recurse -Filter "0Harmony.dll" | Select-Object -First 1 }
-          if (-not $harmony) { throw "找不到 0Harmony.dll —— 没有它注入后会直接崩溃" }
-          Copy-Item $harmony.FullName $publish
-          Write-Host "Harmony: $($harmony.FullName)"
-
-          Get-ChildItem "pcl-hook/out/hook" -Filter "PclHook.deps.json" | ForEach-Object { Copy-Item $_.FullName $publish }
-
-          # 注入器
-          Copy-Item "pcl-hook/out/injector/PclHookInjector.exe" $publish
-
-          # GUI
-          Copy-Item "pcl-hook/out/gui/McBoostGui.exe" $publish
-          Get-ChildItem "pcl-hook/out/gui" -Filter "*.dll" |
-            Where-Object { $_.Name -ne "PclHook.dll" -and $_.Name -ne "0Harmony.dll" } |
-            ForEach-Object { Copy-Item $_.FullName $publish }
-
-          Write-Host "===== 产物清单 ====="
-          Get-ChildItem $publish | ForEach-Object { Write-Host ("  {0,-32} {1,10} bytes" -f $_.Name, $_.Length) }
-
-      - name: 打包成单个 zip
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          # 只保留必需文件，多余的一个不带：
-          #   McBoostGui.exe        GUI 注入器（唯一推荐入口）
-          #   PclHook.dll           补丁本体
-          #   0Harmony.dll          Harmony 运行时（必需）
-          #   PclHook.deps.json     让 .NET 解析到 Harmony
-          #   使用说明.txt
-          # 不打包命令行注入器与 .NET 自动生成的附属 dll —— 对用户是噪音。
-          $keep = @(
-            "publish/McBoostGui.exe",
-            "publish/PclHook.dll",
-            "publish/0Harmony.dll",
-            "publish/PclHook.deps.json",
-            "publish/使用说明.txt"
-          )
-          foreach ($f in $keep) {
-            if (-not (Test-Path $f)) { throw "缺少必需文件: $f" }
-          }
-          $stage = "stage"
+          $stage = "mcboost"
+          Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          foreach ($f in $keep) { Copy-Item $f $stage }
-          Compress-Archive -Path "$stage/*" -DestinationPath "mcboost-pclhook.zip" -Force
-          Write-Host "===== 最终交付：单个 zip ====="
-          Get-Item "mcboost-pclhook.zip" | ForEach-Object { Write-Host ("  {0}  {1} KB" -f $_.Name, [math]::Round($_.Length/1KB,1)) }
-          Get-ChildItem $stage | ForEach-Object { Write-Host ("    ├─ {0}  {1} KB" -f $_.Name, [math]::Round($_.Length/1KB,1)) }
 
-      - name: 上传 Artifact
-        uses: actions/upload-artifact@v4
+          # 钩子
+          Copy-Item "pcl-hook/out/hook/PclHook.dll" $stage
+          $harmony = Get-ChildItem "$env:USERPROFILE\.nuget\packages\lib.harmony" -Recurse -Filter "0Harmony.dll" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.FullName -match "net452|netstandard2.0" } | Select-Object -First 1
+          if (-not $harmony) { throw "找不到 0Harmony.dll" }
+          Copy-Item $harmony.FullName $stage
+
+          # 启动器
+          Copy-Item "pcl-hook/out/launcher/McBoostLauncher.exe" $stage
+          Get-ChildItem "pcl-hook/out/launcher" -Filter "*.dll" | ForEach-Object { Copy-Item $_.FullName $stage }
+          Get-ChildItem "pcl-hook/out/launcher" -Filter "*.json" | ForEach-Object { Copy-Item $_.FullName $stage }
+
+          Copy-Item "pcl-hook/使用说明.txt" $stage -ErrorAction SilentlyContinue
+
+          Write-Host "===== 打包内容 ====="
+          Get-ChildItem $stage | ForEach-Object { Write-Host ("  {0,-34} {1,8} KB" -f $_.Name, [math]::Round($_.Length/1KB,1)) }
+
+          Compress-Archive -Path "$stage/*" -DestinationPath "mcboost-pclce.zip" -Force
+          Write-Host "`n  交付: mcboost-pclce.zip  $([math]::Round((Get-Item 'mcboost-pclce.zip').Length/1KB,1)) KB"
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: PclHook
-          path: publish/
+          name: mcboost-pclce
+          path: mcboost-pclce.zip
           if-no-files-found: error
           retention-days: 30
 
-      - name: 附加到 Release（单个 zip）
+      - name: 附加到 Release
         if: github.event_name == 'release'
         shell: pwsh
-        run: |
-          gh release upload "${{ github.event.release.tag_name }}" "mcboost-pclhook.zip" --repo "${{ github.repository }}" --clobber
+        run: gh release upload "${{ github.event.release.tag_name }}" "mcboost-pclce.zip" --repo "${{ github.repository }}" --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

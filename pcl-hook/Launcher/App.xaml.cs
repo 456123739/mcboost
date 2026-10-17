@@ -1,6 +1,6 @@
 using System.Windows;
 
-namespace McBoost.PclHook.Gui;
+namespace McBoost.Launcher;
 
 public partial class App : Application
 {
