@@ -38,13 +38,36 @@ jobs:
       - name: 汇总产物
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $publish = "publish"
           New-Item -ItemType Directory -Force -Path $publish | Out-Null
+
+          # Hook DLL 本体
           Copy-Item "pcl-hook/out/hook/PclHook.dll" $publish
-          Get-ChildItem "pcl-hook/out/hook" -Filter "0Harmony.dll" -Recurse | ForEach-Object { Copy-Item $_.FullName $publish }
-          Get-ChildItem "pcl-hook/out/hook" -Filter "*.deps.json" -Recurse | ForEach-Object { Copy-Item $_.FullName $publish }
+
+          # Harmony 运行时：目标进程里没有它，必须一起带上。
+          # 从 NuGet 缓存里找，比从输出目录找更可靠。
+          $harmony = Get-ChildItem "$env:USERPROFILE\.nuget\packages\lib.harmony" -Recurse -Filter "0Harmony.dll" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.FullName -match "netstandard2.0|net4" } |
+                     Select-Object -First 1
+          if (-not $harmony) {
+            $harmony = Get-ChildItem "pcl-hook/out/hook" -Recurse -Filter "0Harmony.dll" | Select-Object -First 1
+          }
+          if (-not $harmony) {
+            throw "找不到 0Harmony.dll —— 没有它注入后会直接崩溃，必须带上"
+          }
+          Copy-Item $harmony.FullName $publish
+          Write-Host "Harmony: $($harmony.FullName)"
+
+          # deps.json（让运行时能解析 Harmony）
+          Get-ChildItem "pcl-hook/out/hook" -Filter "PclHook.deps.json" | ForEach-Object { Copy-Item $_.FullName $publish }
+
+          # 注入器
           Copy-Item "pcl-hook/out/injector/PclHookInjector.exe" $publish
-          Get-ChildItem "pcl-hook/out/injector" -Filter "*.dll" | Where-Object { $_.Name -ne "PclHook.dll" } | ForEach-Object { Copy-Item $_.FullName $publish }
+          Get-ChildItem "pcl-hook/out/injector" -Filter "*.dll" |
+            Where-Object { $_.Name -ne "PclHook.dll" -and $_.Name -ne "0Harmony.dll" } |
+            ForEach-Object { Copy-Item $_.FullName $publish }
+
           Write-Host "===== 产物清单 ====="
           Get-ChildItem $publish | ForEach-Object { Write-Host ("  {0,-32} {1,10} bytes" -f $_.Name, $_.Length) }
 
