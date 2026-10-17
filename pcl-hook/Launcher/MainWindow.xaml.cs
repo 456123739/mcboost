@@ -209,14 +209,16 @@ public partial class MainWindow : Window
         Append(content);
         BtnLaunch.IsEnabled = true;
 
+        // 措辞必须诚实：DONE 只代表"常量确实被替换了"，
+        // 不等于"你的下载一定变快"（还受带宽、CDN 限流影响）。
         if (content.Contains("DONE:"))
         {
-            TxtStatus.Text = "✓ 加速已生效";
+            TxtStatus.Text = "✓ 补丁已生效 —— 请实际下一遍整合包对比速度";
             TxtStatus.Foreground = System.Windows.Media.Brushes.LightGreen;
         }
         else if (content.Contains("FAIL"))
         {
-            TxtStatus.Text = "✗ 钩子已加载但补丁失败（见日志）";
+            TxtStatus.Text = "✗ 补丁未生效（看日志最后几行的 FAIL 说明）";
             TxtStatus.Foreground = System.Windows.Media.Brushes.Orange;
         }
         else

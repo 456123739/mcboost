@@ -1,21 +1,38 @@
-mcboost PCL CE 加速 v3.5
+mcboost PCL CE 加速 v3.7
 =======================
 
 针对 PCL CE 2.15.x（你的版本：2.15.1 Beta 1）
 
-作用：把「每个文件的下载分片数」从硬编码的 4 提升到 8（可调 4~32）。
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+先说清楚这一版修的是什么
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  为什么是这里 —— PCL CE 2.15.1 源码 FileDownloader.cs：
+v3.5 / v3.6 会提示"已 patch 成功"，但**实际一处都没改到**。两个原因：
+
+1. FileDownloader.DownloadSingleAsync 是 async 方法，
+   方法体全在编译器生成的状态机 MoveNext() 里。
+   之前 patch 的是外层那个壳，transpiler 根本看不到 Math.Min(?, 4)。
+
+2. Harmony 的 transpiler 是 JIT 时才执行的。
+   harmony.Patch() 返回成功只代表"登记成功"，不代表常量被替换。
+   我之前据此就打 DONE —— 所以"提示成功"是假的。
+
+v3.7 的修正：
+  · 用 AsyncStateMachineAttribute 定位到 MoveNext() 再 patch
+  · patch 后强制 PrepareMethod 触发 JIT，再检查 transpiler 实际替换了几处
+  · 只有替换数 > 0 才输出 DONE，否则明确输出 FAIL
+
+所以这次的日志是可信的：DONE 就真的改了，FAIL 就真的没改。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+作用
+  把「每个文件的下载分片数」从硬编码的 4 提升到 8（可调 4~32）。
+
+  PCL CE 2.15.1 源码 FileDownloader.cs：
     var perFileThreadLimit = Math.Max(1, ModNet.NetTaskThreadLimit);
     var chunkCount = Math.Min(perFileThreadLimit, 4);   ← 每文件最多 4 个分片
-    new DownloadConfiguration {
-        ChunkCount = chunkCount,
-        ParallelCount = chunkCount,
-        ...
-    }
-
-  也就是说不管 NetTaskThreadLimit 调到多少，Math.Min 都会把它压回 4。
-  每个文件只有 4 条连接 —— 这才是下载慢的真正原因。
+    new DownloadConfiguration { ChunkCount = chunkCount, ParallelCount = chunkCount, ... };
 
 不修改下载源、不注入进程、不修改 PCL CE 任何文件。
 
@@ -26,55 +43,36 @@ mcboost PCL CE 加速 v3.5
   2. 运行 McBoostLauncher.exe
   3. 调「每文件分片数」（默认 8）
   4. 点「启动 PCL CE（已加速）」
+  5. 正常去下载整合包，对比速度
 
-  以后每次都用 McBoostLauncher.exe 启动。
-
-找不到 PCL CE
-  点「浏览…」手动选 MultiMc.exe，选一次就记住。
+找不到 PCL CE → 点「浏览…」手动选 MultiMc.exe，选一次就记住。
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-文件（必须在同一目录）
-  McBoostLauncher.exe
-  McBoostLauncher.dll
-  McBoostLauncher.runtimeconfig.json  ← 缺它打不开
-  McBoostLauncher.deps.json
-  PclHook.dll                         补丁本体
-  0Harmony.dll                        Harmony 运行时（必需）
-  README.txt
+日志位置
+  %APPDATA%\PCL\mcboost-hook.log
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-原理
-  用 .NET 官方机制 DOTNET_STARTUP_HOOKS：设置该环境变量后，
-  运行时会在 PCL CE 的 Main() 之前加载 PclHook.dll 并执行
-  StartupHook.Initialize()。
-
-  补丁用 Harmony Transpiler 改写 FileDownloader.DownloadSingleAsync
-  里的一个常量：把 Math.Min(?, 4) 的 4 换成目标分片数。
-  分块、断点续传、进度、重试全部沿用 PCL 自己的实现。
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-验证
-  日志: %APPDATA%\PCL\mcboost-hook.log
-
-  成功会看到：
-    patcher start (v3.5, 目标每文件 8 分片)
-    NetTaskThreadLimit: 16 -> 64
+成功时会看到（关键三行）：
+    Harmony 程序集: 2.4.3.0 @ ...\net10.0\0Harmony.dll
+    补丁目标: PCL.Network.FileDownloader+<DownloadSingleAsync>d__5.MoveNext()（async 状态机）
     transpiler: 已替换 1 处 Math.Min(?, 4) -> 8
-    DONE: 已 patch FileDownloader.DownloadSingleAsync，分片上限 4 -> 8
+    DONE: 已替换 1 处 Math.Min(?, 4) -> 8
 
-  启动器会自动读日志并显示结果。
+失败时会看到：
+    transpiler: 未找到 Math.Min(?, 4)
+    FAIL: transpiler 执行了但替换 0 处 —— 该方法里没有 Math.Min(?, 4)
+    这意味着本次补丁**没有生效**，下载速度不会变化。
+    （后面还有 IL 长度、ldc.i4.4 出现次数、状态机字段列表）
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-排错
-  没有日志        → 钩子没加载，确认启动的是 MultiMc.exe
-  找不到 FileDownloader → 版本不同，把日志发到 issue
-  未匹配到 Math.Min(?, 4) → IL 结构变化，把日志发到 issue
-  速度没变化      → 可能被 CDN 限流，把分片数调到 6 或 4 再试
-  速度反而变慢    → 同上，调低分片数
+如果显示 DONE 但速度仍然没变
+  那就不是分片数的问题了，可能是：
+    · 带宽本身已经跑满
+    · CDN 对单 IP 限流（把分片数调到 4 对比，若变快说明是限流）
+    · 小于 1MB 的文件完全不分片（PCL 的 MinimumSizeOfChunking = 1MB），
+      整合包里大量小 mod 吃不到多线程
+  请把日志发我，我按实际情况改。
 
 还原
   直接双击原版 PCL CE 即可（不带环境变量就是原版行为）。
