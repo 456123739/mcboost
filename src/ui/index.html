@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mcboost — 我的世界整合包下载加速器</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --line: #2a2f3a;
+    --fg: #e6e9ef; --dim: #8b93a3; --accent: #4ade80; --accent2: #38bdf8;
+    --warn: #fbbf24; --err: #f87171; --ok: #4ade80;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 24px 20px 80px; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
+  h1 { font-size: 22px; margin: 0; letter-spacing: .3px; }
+  h1 span { color: var(--accent); }
+  .sub { color: var(--dim); font-size: 13px; }
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; margin: 14px 0 22px; }
+  .badge {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 999px;
+    padding: 3px 11px; font-size: 12px; color: var(--dim);
+  }
+  .badge b { color: var(--fg); font-weight: 600; }
+  .badge.ok b { color: var(--ok); }
+  .badge.warn b { color: var(--warn); }
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 20px; }
+  .tab {
+    padding: 9px 16px; cursor: pointer; color: var(--dim); border: none; background: none;
+    font-size: 14px; border-bottom: 2px solid transparent; margin-bottom: -1px;
+  }
+  .tab:hover { color: var(--fg); }
+  .tab.active { color: var(--fg); border-bottom-color: var(--accent); }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; margin-bottom: 16px; }
+  .panel h2 { margin: 0 0 14px; font-size: 15px; font-weight: 600; }
+  label { display: block; font-size: 12px; color: var(--dim); margin-bottom: 5px; }
+  input[type=text], input[type=number], select {
+    width: 100%; background: var(--panel2); border: 1px solid var(--line); color: var(--fg);
+    border-radius: 7px; padding: 9px 11px; font-size: 14px; font-family: inherit;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--accent2); }
+  .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .row + .row { margin-top: 12px; }
+  button {
+    background: var(--accent); color: #06210f; border: none; border-radius: 7px;
+    padding: 9px 18px; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit;
+  }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.ghost { background: var(--panel2); color: var(--fg); border: 1px solid var(--line); font-weight: 500; }
+  button.danger { background: var(--err); color: #2a0808; }
+  .actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; align-items: center; }
+  .bar { height: 20px; background: var(--panel2); border-radius: 5px; overflow: hidden; position: relative; border: 1px solid var(--line); }
+  .bar > i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent2), var(--accent)); width: 0; transition: width .2s; }
+  .bar > b { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 600; }
+  .stats { display: flex; gap: 20px; flex-wrap: wrap; margin: 12px 0; font-size: 13px; }
+  .stats div { color: var(--dim); }
+  .stats b { color: var(--fg); font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th { text-align: left; color: var(--dim); font-weight: 500; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+  td { padding: 6px 8px; border-bottom: 1px solid #21252e; }
+  tr.done td:first-child { color: var(--ok); }
+  tr.failed td:first-child { color: var(--err); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .log {
+    background: #0b0d11; border: 1px solid var(--line); border-radius: 8px; padding: 12px;
+    height: 240px; overflow-y: auto; font-family: ui-monospace, Menlo, monospace;
+    font-size: 12px; white-space: pre-wrap; word-break: break-all; line-height: 1.55;
+  }
+  .log .warn { color: var(--warn); }
+  .log .error { color: var(--err); }
+  .log .info { color: var(--dim); }
+  .muted { color: var(--dim); }
+  .hidden { display: none !important; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; font-size: 13px; }
+  .kv dt { color: var(--dim); }
+  .kv dd { margin: 0; }
+  .pill { display:inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line); color: var(--dim); }
+  .scroll { max-height: 340px; overflow-y: auto; }
+  code { background: var(--panel2); padding: 1px 6px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>mc<span>boost</span></h1>
+    <span class="sub">我的世界整合包下载加速器</span>
+  </header>
+  <div class="badges" id="badges"><span class="badge">正在检查环境…</span></div>
+
+  <div class="tabs">
+    <button class="tab active" data-tab="pack">下载整合包</button>
+    <button class="tab" data-tab="probe">测速诊断</button>
+    <button class="tab" data-tab="mirrors">镜像状态</button>
+  </div>
+
+  <!-- ============ 整合包下载 ============ -->
+  <section id="tab-pack">
+    <div class="panel">
+      <h2>1. 选择整合包</h2>
+      <label>整合包文件路径 / 下载链接 / Modrinth 项目名</label>
+      <input type="text" id="input" placeholder="例如：fabulously-optimized  或  /path/to/pack.zip  或  https://.../pack.mrpack">
+      <div class="row" style="margin-top:12px">
+        <div>
+          <label>输出目录</label>
+          <input type="text" id="outDir" placeholder="/home/user/mcboost-downloads">
+        </div>
+        <div>
+          <label>同时下载文件数</label>
+          <input type="number" id="concurrency" min="1" max="64" value="6">
+        </div>
+        <div>
+          <label>每文件连接数</label>
+          <input type="number" id="connections" min="1" max="64" value="8">
+        </div>
+        <div>
+          <label>下载引擎</label>
+          <select id="engine">
+            <option value="auto">自动（有 aria2c 就用）</option>
+            <option value="aria2">aria2c</option>
+            <option value="builtin">内置分片引擎</option>
+          </select>
+        </div>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <div>
+          <label>只下载匹配的文件（正则，可留空）</label>
+          <input type="text" id="include" placeholder="例如 ^mods/ 或 sodium">
+        </div>
+        <div>
+          <label>端</label>
+          <select id="side"><option value="client">客户端 (client)</option><option value="server">服务端 (server)</option></select>
+        </div>
+        <div>
+          <label>镜像加速</label>
+          <select id="useMirrors"><option value="true">开启（自动测速选源）</option><option value="false">关闭（只连官方源）</option></select>
+        </div>
+        <div>
+          <label>实例文件夹名（可留空）</label>
+          <input type="text" id="instanceName" placeholder="默认用整合包名">
+        </div>
+      </div>
+      <div class="actions">
+        <button id="btnPlan" class="ghost">解析预览（不下载）</button>
+        <button id="btnStart">开始下载</button>
+        <button id="btnCancel" class="danger hidden">取消任务</button>
+        <span class="muted" id="planHint"></span>
+      </div>
+    </div>
+
+    <div class="panel hidden" id="planPanel">
+      <h2>解析结果</h2>
+      <dl class="kv" id="planKv"></dl>
+      <div id="planSample" style="margin-top:14px"></div>
+    </div>
+
+    <div class="panel hidden" id="progressPanel">
+      <h2>下载进度 <span class="pill" id="jobState">—</span></h2>
+      <div class="bar"><i id="barFill"></i><b id="barText">0%</b></div>
+      <div class="stats">
+        <div>文件 <b id="stFiles">0/0</b></div>
+        <div>已下载 <b id="stBytes">0 B</b></div>
+        <div>速度 <b id="stSpeed">0 B/s</b></div>
+        <div>已用 <b id="stElapsed">00:00</b></div>
+        <div>失败 <b id="stFailed">0</b></div>
+      </div>
+      <div class="scroll"><table>
+        <thead><tr><th style="width:44%">文件</th><th>大小</th><th>进度</th><th>来源</th></tr></thead>
+        <tbody id="taskRows"></tbody>
+      </table></div>
+    </div>
+
+    <div class="panel hidden" id="logPanel">
+      <h2>日志</h2>
+      <div class="log" id="log"></div>
+    </div>
+  </section>
+
+  <!-- ============ 测速诊断 ============ -->
+  <section id="tab-probe" class="hidden">
+    <div class="panel">
+      <h2>单文件多源测速</h2>
+      <p class="muted" style="margin-top:0">给出一个下载链接，测出它所有候选源（官方源 + 命中的镜像）的真实吞吐，告诉你该走哪条源。</p>
+      <label>文件 URL</label>
+      <input type="text" id="probeUrl" placeholder="https://cdn.modrinth.com/data/.../something.jar">
+      <div class="actions">
+        <button id="btnProbe">开始测速</button>
+        <span class="muted">每条流至少测 2 秒，避开 TCP 慢启动造成的假数据</span>
+      </div>
+    </div>
+    <div class="panel hidden" id="probePanel">
+      <h2>测速结果</h2>
+      <table><thead><tr><th>源</th><th>吞吐</th><th>流数</th><th>耗时</th></tr></thead><tbody id="probeRows"></tbody></table>
+    </div>
+  </section>
+
+  <!-- ============ 镜像状态 ============ -->
+  <section id="tab-mirrors" class="hidden">
+    <div class="panel">
+      <h2>内置镜像规则</h2>
+      <div id="mirrorList" class="muted">加载中…</div>
+      <div class="actions">
+        <button id="btnMirrorTest">实测全部镜像（较慢）</button>
+        <span class="muted" id="mirrorHint"></span>
+      </div>
+    </div>
+    <div class="panel hidden" id="mirrorTestPanel">
+      <h2>实测结果</h2>
+      <table><thead><tr><th>规则</th><th>状态</th><th>镜像延迟</th><th>官方延迟</th></tr></thead><tbody id="mirrorTestRows"></tbody></table>
+    </div>
+  </section>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => {
+  if (n == null || Number.isNaN(n)) return '?';
+  n = Number(n); if (n < 1024) return n + ' B';
+  const u = ['B','KB','MB','GB','TB']; let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v : v.toFixed(2)) + ' ' + u[i];
+};
+const fmtDur = (s) => { s = Math.max(0, Math.round(s||0)); const h=Math.floor(s/3600), m=Math.floor(s%3600/60), x=s%60, p=(v)=>String(v).padStart(2,'0'); return h?`${h}:${p(m)}:${p(x)}`:`${p(m)}:${p(x)}`; };
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+// —— 顶部环境徽章 ——
+(async () => {
+  try {
+    const d = await (await fetch('/api/doctor')).json();
+    $('badges').innerHTML = [
+      `<span class="badge">Node <b>${esc(d.node)}</b></span>`,
+      `<span class="badge">CPU <b>${d.cpus} 核</b></span>`,
+      d.aria2.available
+        ? `<span class="badge ok">aria2c <b>v${esc(d.aria2.version)}</b></span>`
+        : `<span class="badge warn">aria2c <b>未安装</b></span>`,
+      `<span class="badge">引擎 <b>${esc(d.engine)}</b></span>`,
+      `<span class="badge">默认 <b>${d.defaults.concurrency} 文件 × ${d.defaults.connections} 连接</b></span>`,
+      d.defaults.curseforgeApiKey
+        ? `<span class="badge ok">CurseForge API key <b>已配置</b></span>`
+        : `<span class="badge">CurseForge key <b>未配置</b></span>`,
+    ].join('');
+    $('concurrency').value = d.defaults.concurrency;
+    $('connections').value = d.defaults.connections;
+    if (d.homedir) $('outDir').placeholder = d.homedir + '/mcboost-downloads';
+  } catch (e) {
+    $('badges').innerHTML = `<span class="badge warn">环境检查失败: <b>${esc(e.message)}</b></span>`;
+  }
+})();
+
+// —— 标签页 ——
+document.querySelectorAll('.tab').forEach((t) => t.onclick = () => {
+  document.querySelectorAll('.tab').forEach((x) => x.classList.toggle('active', x === t));
+  for (const name of ['pack','probe','mirrors']) $('tab-' + name).classList.toggle('hidden', name !== t.dataset.tab);
+});
+
+function opts() {
+  return {
+    concurrency: Number($('concurrency').value) || 6,
+    connections: Number($('connections').value) || 8,
+    engine: $('engine').value,
+    useMirrors: $('useMirrors').value === 'true',
+    side: $('side').value,
+    include: $('include').value.trim() || undefined,
+    instanceName: $('instanceName').value.trim() || undefined,
+  };
+}
+
+// —— 解析预览 ——
+$('btnPlan').onclick = async () => {
+  const input = $('input').value.trim();
+  if (!input) { $('planHint').textContent = '请先填写整合包来源'; return; }
+  $('btnPlan').disabled = true; $('planHint').textContent = '解析中…（CurseForge 包需要逐个查询文件信息，可能较慢）';
+  try {
+    const r = await fetch('/api/plan', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ input, options: opts() }) });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    $('planPanel').classList.remove('hidden');
+    $('planKv').innerHTML = `
+      <dt>类型</dt><dd>${esc(d.packType)}</dd>
+      <dt>名称</dt><dd>${esc(d.meta.name)} ${esc(d.meta.version||'')}</dd>
+      <dt>游戏版本</dt><dd>${esc(d.meta.mcVersion||'未知')}</dd>
+      <dt>加载器</dt><dd>${esc(d.meta.loader||'未知')}</dd>
+      <dt>可下载文件</dt><dd><b>${d.taskCount}</b> 个，约 ${fmt(d.totalBytes)}</dd>
+      ${d.unresolved ? `<dt>无法自动解析</dt><dd style="color:var(--warn)">${d.unresolved} 个（需 CurseForge API key）</dd>` : ''}
+    `;
+    $('planSample').innerHTML = `<div class="muted" style="margin-bottom:6px">前 ${d.sample.length} 个文件</div>
+      <div class="scroll"><table><thead><tr><th>文件</th><th>大小</th><th>来源主机</th><th>候选源</th></tr></thead><tbody>
+      ${d.sample.map((t) => `<tr><td>${esc(t.label)}</td><td>${t.size?fmt(t.size):'?'}</td><td class="mono">${esc(t.host)}</td><td>${t.candidates}</td></tr>`).join('')}
+      </tbody></table></div>`;
+    if (d.warnings?.length) $('planHint').innerHTML = `<span style="color:var(--warn)">${esc(d.warnings.join(' / '))}</span>`;
+    else $('planHint').textContent = '解析完成，可以开始下载';
+  } catch (e) {
+    $('planHint').innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`;
+  } finally { $('btnPlan').disabled = false; }
+};
+
+// —— 启动下载 + SSE ——
+let es = null, currentJob = null, jobStart = 0, aggDone = 0;
+$('btnStart').onclick = async () => {
+  const input = $('input').value.trim();
+  if (!input) { $('planHint').textContent = '请先填写整合包来源'; return; }
+  $('btnStart').disabled = true;
+  $('log').innerHTML = ''; $('taskRows').innerHTML = '';
+  aggDone = 0;
+  try {
+    const r = await fetch('/api/jobs', { method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ input, outDir: $('outDir').value.trim() || undefined, options: opts() }) });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    currentJob = d.jobId;
+    $('progressPanel').classList.remove('hidden');
+    $('logPanel').classList.remove('hidden');
+    $('btnCancel').classList.remove('hidden');
+    subscribe(currentJob);
+  } catch (e) {
+    $('planHint').innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`;
+    $('btnStart').disabled = false;
+  }
+};
+
+$('btnCancel').onclick = async () => {
+  if (!currentJob) return;
+  await fetch(`/api/jobs/${currentJob}/cancel`, { method: 'POST' });
+  $('btnCancel').disabled = true;
+};
+
+function subscribe(jobId) {
+  if (es) es.close();
+  es = new EventSource(`/api/jobs/${jobId}/events`);
+  es.onmessage = (m) => {
+    let ev; try { ev = JSON.parse(m.data); } catch { return; }
+    handle(ev);
+  };
+  es.onerror = () => { /* EventSource 会自动重连 */ };
+}
+
+const taskRow = (id) => {
+  let tr = document.querySelector(`tr[data-id="${id}"]`);
+  if (!tr) {
+    tr = document.createElement('tr');
+    tr.dataset.id = id;
+    tr.innerHTML = `<td></td><td class="mono"></td><td class="mono"></td><td class="mono"></td>`;
+    $('taskRows').appendChild(tr);
+  }
+  return tr;
+};
+
+function setOverall(done, skipped, failed, total, bytesDone, totalBytes) {
+  const finished = (done||0) + (skipped||0) + (failed||0);
+  const ratio = total ? finished / total : 0;
+  $('barFill').style.width = (ratio * 100).toFixed(1) + '%';
+  $('barText').textContent = `${(ratio*100).toFixed(1)}%   (${finished}/${total} 文件)`;
+  $('stFiles').textContent = `${finished}/${total}`;
+  $('stBytes').textContent = totalBytes ? `${fmt(bytesDone)} / ${fmt(totalBytes)}` : fmt(bytesDone);
+  $('stFailed').textContent = failed ?? 0;
+  const el = (Date.now() - jobStart) / 1000;
+  $('stElapsed').textContent = fmtDur(el);
+  if (bytesDone > 0 && el > 0.5) $('stSpeed').textContent = fmt(bytesDone / el) + '/s';
+}
+
+function handle(ev) {
+  if (ev.type === 'snapshot') {
+    const j = ev.job;
+    jobStart = j.startedAt || Date.now();
+    $('jobState').textContent = j.state;
+    for (const t of j.tasks) {
+      const tr = taskRow(t.id);
+      tr.children[0].textContent = t.label;
+      tr.children[1].textContent = t.size ? fmt(t.size) : '?';
+      tr.children[2].textContent = fmt(t.downloaded || 0);
+      tr.children[3].textContent = t.source || '';
+      if (t.status === 'done') tr.classList.add('done');
+      if (t.status === 'failed') tr.classList.add('failed');
+    }
+    for (const l of j.logs) addLog(l.level, l.message);
+    return;
+  }
+  if (ev.type === 'state') { $('jobState').textContent = ev.state; return; }
+  if (ev.type === 'plan') {
+    jobStart = Date.now();
+    $('planPanel').classList.remove('hidden');
+    $('planKv').innerHTML = `<dt>名称</dt><dd>${esc(ev.meta.name)} ${esc(ev.meta.version||'')}</dd>
+      <dt>游戏版本</dt><dd>${esc(ev.meta.mcVersion||'未知')}</dd>
+      <dt>加载器</dt><dd>${esc(ev.meta.loader||'未知')}</dd>
+      <dt>目标目录</dt><dd class="mono">${esc(ev.instanceDir)}</dd>
+      <dt>文件数</dt><dd><b>${ev.taskCount}</b> 个，约 ${fmt(ev.totalBytes)}</dd>`;
+    ev._total = ev.taskCount; ev._totalBytes = ev.totalBytes;
+    $('barText').textContent = `0%   (0/${ev.taskCount} 文件)`;
+    window.__total = ev.taskCount; window.__totalBytes = ev.totalBytes;
+    return;
+  }
+  if (ev.type === 'task:start') {
+    const tr = taskRow(ev.id);
+    tr.children[0].textContent = ev.label;
+    tr.children[1].textContent = ev.size ? fmt(ev.size) : '?';
+    tr.children[2].textContent = '0 B';
+    tr.children[3].textContent = '选源中…';
+    return;
+  }
+  if (ev.type === 'task:source') {
+    const tr = taskRow(ev.id);
+    tr.children[3].textContent = ev.source + (ev.cached ? ' (缓存)' : '');
+    return;
+  }
+  if (ev.type === 'task:progress') {
+    const tr = taskRow(ev.id);
+    const r = ev.total ? ev.downloaded / ev.total : 0;
+    tr.children[2].textContent = ev.total ? `${fmt(ev.downloaded)} / ${fmt(ev.total)}  ${(r*100).toFixed(0)}%` : fmt(ev.downloaded);
+    return;
+  }
+  if (ev.type === 'task:done') {
+    const tr = taskRow(ev.id);
+    tr.classList.add(ev.status === 'skipped' ? '' : 'done');
+    tr.children[2].textContent = ev.status === 'skipped' ? '已存在，跳过' : `${fmt(ev.size)}  完成`;
+    aggDone += ev.bytes || 0;
+    setOverall(ev.done, ev.skipped, ev.failed, window.__total, aggDone, window.__totalBytes);
+    return;
+  }
+  if (ev.type === 'task:failed') {
+    const tr = taskRow(ev.id);
+    tr.classList.add('failed');
+    tr.children[2].textContent = '失败: ' + ev.error;
+    addLog('error', `✗ ${ev.label} — ${ev.error}`);
+    setOverall(ev.done, ev.skipped, ev.failed, window.__total, aggDone, window.__totalBytes);
+    return;
+  }
+  if (ev.type === 'log') { addLog(ev.level, ev.message); return; }
+  if (ev.type === 'finished') {
+    $('jobState').textContent = ev.state;
+    $('btnStart').disabled = false;
+    $('btnCancel').classList.add('hidden');
+    $('btnCancel').disabled = false;
+    if (ev.error) addLog('error', '任务失败: ' + ev.error);
+    if (ev.summary && !ev.summary.dryRun) {
+      addLog('info', `完成：成功 ${ev.summary.done}，跳过 ${ev.summary.skipped}，失败 ${ev.summary.failed}，` +
+        `共 ${fmt(ev.summary.bytes)}，耗时 ${fmtDur(ev.summary.elapsed)}`);
+    }
+    if (es) { es.close(); es = null; }
+  }
+}
+
+function addLog(level, msg) {
+  const d = document.createElement('div');
+  d.className = level;
+  d.textContent = msg;
+  $('log').appendChild(d);
+  $('log').scrollTop = $('log').scrollHeight;
+}
+
+// —— 测速 ——
+$('btnProbe').onclick = async () => {
+  const url = $('probeUrl').value.trim();
+  if (!url) return;
+  $('btnProbe').disabled = true; $('probePanel').classList.remove('hidden');
+  $('probeRows').innerHTML = '<tr><td colspan="4" class="muted">测速中（每条流至少 2 秒）…</td></tr>';
+  try {
+    const r = await fetch('/api/probe', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ url }) });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    $('probeRows').innerHTML = d.results.map((x) => `<tr>
+      <td>${esc(x.source)}<div class="mono muted" style="font-size:11px">${esc(x.url)}</div></td>
+      <td>${x.ok ? `<b style="color:var(--ok)">${esc(x.bpsText)}</b>` : `<span style="color:var(--err)">不可用 ${esc(x.error||'')}</span>`}</td>
+      <td>${x.streams}</td><td>${x.ms}ms</td></tr>`).join('');
+  } catch (e) {
+    $('probeRows').innerHTML = `<tr><td colspan="4" style="color:var(--err)">${esc(e.message)}</td></tr>`;
+  } finally { $('btnProbe').disabled = false; }
+};
+
+// —— 镜像 ——
+(async () => {
+  try {
+    const d = await (await fetch('/api/mirrors')).json();
+    const render = (list, label) => list.length ? `<div style="margin-bottom:10px"><b>${label}</b>
+      ${list.map((m) => `<div style="margin:8px 0 0 12px">
+        <span class="pill">${m.enabled === false ? '已禁用' : '启用'}</span> <b>${esc(m.name)}</b>
+        <div class="mono muted" style="font-size:11.5px;margin-left:4px">${m.rules.map(esc).join('<br>')}</div>
+      </div>`).join('')}</div>` : '';
+    $('mirrorList').innerHTML =
+      `<div class="muted" style="margin-bottom:10px">镜像总开关：<b style="color:${d.useMirrors?'var(--ok)':'var(--err)'}">${d.useMirrors?'开启':'关闭'}</b>　（镜像仅作为候选源，实际走哪条由测速决定，所以错的规则不会导致下载失败）</div>`
+      + render(d.builtin, '内置') + render(d.custom, '自定义');
+  } catch (e) { $('mirrorList').textContent = '加载失败: ' + e.message; }
+})();
+
+$('btnMirrorTest').onclick = async () => {
+  $('btnMirrorTest').disabled = true;
+  $('mirrorHint').textContent = '实测中，请稍候…';
+  try {
+    const r = await fetch('/api/mirrors/test', { method: 'POST' });
+    const d = await r.json();
+    $('mirrorTestPanel').classList.remove('hidden');
+    const tag = (s) => s === 'ok' ? '<span style="color:var(--ok)">✓ 可用</span>'
+      : s === 'probe-bad' ? '<span style="color:var(--warn)">? 无法判定</span>'
+      : s === 'skip' ? '<span class="muted">– 跳过</span>'
+      : '<span style="color:var(--err)">✗ 不可用</span>';
+    $('mirrorTestRows').innerHTML = d.reports.map((x) => `<tr>
+      <td class="mono" style="font-size:11.5px">${esc(x.rule)}</td>
+      <td>${tag(x.status)}${x.speedup && x.speedup > 1.05 ? ` <span style="color:var(--ok)">快 ${x.speedup.toFixed(1)}×</span>` : ''}</td>
+      <td>${x.ms != null ? x.ms + 'ms' : (esc(x.error||x.note||''))}</td>
+      <td>${x.originMs != null ? x.originMs + 'ms' : '—'}</td></tr>`).join('');
+    $('mirrorHint').textContent = '实测完成';
+  } catch (e) { $('mirrorHint').textContent = '实测失败: ' + e.message; }
+  finally { $('btnMirrorTest').disabled = false; }
+};
+</script>
+</body>
+</html>

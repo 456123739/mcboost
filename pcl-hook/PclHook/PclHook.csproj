@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>PclHook</AssemblyName>
+    <RootNamespace>McBoost.PclHook</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <OutputType>Library</OutputType>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <DebugType>portable</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Harmony 用于在运行时改写 IL，无需修改 PCL CE 本身 -->
+    <PackageReference Include="Lib.Harmony" Version="2.3.3.0" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,18 @@
+{
+  "name": "mcboost",
+  "version": "0.1.0",
+  "description": "Minecraft 整合包下载加速器 — 多连接分片 + 镜像加速 + 并发队列",
+  "type": "module",
+  "bin": {
+    "mcboost": "./bin/mcboost.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test",
+    "start": "node bin/mcboost.js"
+  },
+  "license": "MIT",
+  "private": true
+}
