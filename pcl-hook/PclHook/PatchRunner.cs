@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using HarmonyLib;
 
@@ -86,31 +87,54 @@ namespace McBoost.PclHook
                 typeof(PatchRunner).GetMethod(nameof(Transpile),
                     BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)!);
 
-            var patched = false;
+            // async 方法的真实 IL 在编译器生成的状态机 MoveNext() 里。
+            // 直接 patch DownloadAsync 只会打到创建状态机的壳上，永远匹配不到 Math.Clamp。
+            // 这里用 AsyncStateMachineAttribute 精确定位 MoveNext，
+            // 不依赖 Harmony 的 MethodType 枚举，版本兼容性更好。
+            var targets = new List<(string name, MethodBase method)>();
 
-            // 依次尝试几种目标，全部失败才算失败
-            foreach (var attempt in new[]
-                     {
-                         (name: "Async(MoveNext)", type: MethodType.Async),
-                         (name: "Normal(DownloadAsync本体)", type: MethodType.Normal),
-                     })
+            var attr = downloadAsync.GetCustomAttribute<AsyncStateMachineAttribute>();
+            if (attr?.StateMachineType != null)
+            {
+                var moveNext = attr.StateMachineType.GetMethod("MoveNext",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (moveNext != null)
+                {
+                    Diag.Log($"async 状态机: {attr.StateMachineType.FullName}.MoveNext");
+                    targets.Add(("MoveNext(状态机)", moveNext));
+                }
+                else
+                {
+                    Diag.Log("状态机类型存在但找不到 MoveNext");
+                }
+            }
+            else
+            {
+                Diag.Log("DownloadAsync 不是 async 方法（无状态机），直接 patch 本体");
+            }
+
+            // 兜底：本体也试一次
+            targets.Add(("DownloadAsync(本体)", downloadAsync));
+
+            var patched = false;
+            foreach (var (name, method) in targets)
             {
                 try
                 {
-                    harmony.Patch(downloadAsync, transpiler: transpiler, methodType: attempt.type);
+                    harmony.Patch(method, transpiler: transpiler);
                     patched = true;
-                    Diag.Log($"OK: patch 已应用到 {attempt.name}");
+                    Diag.Log($"OK: patch 已应用到 {name}");
                     break;
                 }
                 catch (Exception ex)
                 {
-                    Diag.Log($"patch 失败 [{attempt.name}]: {ex.GetType().Name}: {ex.Message}");
+                    Diag.Log($"patch 失败 [{name}]: {ex.GetType().Name}: {ex.Message}");
                 }
             }
 
             if (!patched)
             {
-                Diag.Log("FAIL: 所有 patch 方式均失败");
+                Diag.Log("FAIL: 所有 patch 目标均失败");
                 return;
             }
 
