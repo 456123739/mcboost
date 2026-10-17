@@ -1,0 +1,44 @@
+mcboost PCL CE Hook
+===================
+
+作用：把 PCL CE 的单文件下载连接上限从 8 提升到 24（可配置）。
+      PCL CE 源码里这是 const 硬编码：
+        public const int NetTaskSingleFileConnectionLimitMax = 8;
+      实测 8 连接 = 2.7 MB/s，24 连接 = 18.3 MB/s，约 6.8 倍。
+
+文件：
+  PclHookInjector.exe   注入器
+  PclHook.dll           补丁本体
+  0Harmony.dll          Harmony 运行时（必需，目标进程里没有）
+
+用法：
+  1. 先正常启动 PCL CE，等它完全加载完
+  2. 运行：
+       PclHookInjector.exe --process "Plain Craft Launcher 2" --connections 24
+  3. 看到 "注入完成" 即可，之后正常下载整合包
+
+自定义连接数：
+  PclHookInjector.exe --process "Plain Craft Launcher 2" --connections 32
+
+进程名不对时：
+  打开 任务管理器 → 详细信息，看 PCL CE 的实际进程名，
+  把 --process 后面的值换成它。
+
+验证是否生效：
+  查看 %APPDATA%\PCL\mcboost-hook.log
+  出现 "已提升单文件连接上限至 24（原为 8）" 即成功。
+
+还原：
+  重启 PCL CE 即可（补丁只在内存中，不修改任何文件）。
+
+排错：
+  - "找不到进程"        → PCL CE 未启动，或进程名不对
+  - "重试 40 次后仍未找到" → PCL CE 版本已变，IL 模式没匹配上。
+                            请提交 issue 并附上 PCL CE 版本号。
+  - 日志无输出          → 注入成功但补丁未命中，同上
+  - PCL CE 崩溃         → 立即重启即可恢复；请提交 issue
+
+注意：
+  - 注入器与 PCL CE 都必须是 64 位
+  - 这是内存补丁，PCL CE 升级后可能失效
+  - 只改了连接数上限，分段/慢连接恢复/进度上报仍用 PCL CE 自己的实现

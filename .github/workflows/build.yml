@@ -3,13 +3,16 @@ name: 构建 PCL CE Hook DLL
 on:
   push:
     branches: [main, master]
-    paths: ['pcl-hook/**']
+    paths:
+      - 'pcl-hook/**'
+      - '.github/workflows/build.yml'
   pull_request:
-    paths: ['pcl-hook/**']
+    paths:
+      - 'pcl-hook/**'
   workflow_dispatch:
     inputs:
       connections:
-        description: '默认单文件连接数（注入时可用 --connections 覆盖）'
+        description: '默认单文件连接数'
         required: false
         default: '24'
 
@@ -26,11 +29,9 @@ jobs:
           dotnet-version: '10.0.x'
           include-prerelease: true
 
-      # ---- 构建被注入的 Hook DLL ----
       - name: 编译 PclHook
         run: dotnet build pcl-hook/PclHook/PclHook.csproj -c Release -o pcl-hook/out/hook
 
-      # ---- 构建注入器 ----
       - name: 编译注入器
         run: dotnet build pcl-hook/Injector/PclHookInjector.csproj -c Release -o pcl-hook/out/injector
 
@@ -39,69 +40,20 @@ jobs:
         run: |
           $publish = "publish"
           New-Item -ItemType Directory -Force -Path $publish | Out-Null
-
-          # Hook DLL 本体
           Copy-Item "pcl-hook/out/hook/PclHook.dll" $publish
-          # Harmony 运行时依赖（目标进程里没有，必须一起带上）
-          Get-ChildItem "pcl-hook/out/hook" -Filter "0Harmony.dll" -Recurse |
-            ForEach-Object { Copy-Item $_.FullName $publish }
-          Get-ChildItem "pcl-hook/out/hook" -Filter "*.deps.json" -Recurse |
-            ForEach-Object { Copy-Item $_.FullName $publish }
-
-          # 注入器
+          Get-ChildItem "pcl-hook/out/hook" -Filter "0Harmony.dll" -Recurse | ForEach-Object { Copy-Item $_.FullName $publish }
+          Get-ChildItem "pcl-hook/out/hook" -Filter "*.deps.json" -Recurse | ForEach-Object { Copy-Item $_.FullName $publish }
           Copy-Item "pcl-hook/out/injector/PclHookInjector.exe" $publish
-          Get-ChildItem "pcl-hook/out/injector" -Filter "*.dll" |
-            Where-Object { $_.Name -ne "PclHook.dll" } |
-            ForEach-Object { Copy-Item $_.FullName $publish }
-
+          Get-ChildItem "pcl-hook/out/injector" -Filter "*.dll" | Where-Object { $_.Name -ne "PclHook.dll" } | ForEach-Object { Copy-Item $_.FullName $publish }
           Write-Host "===== 产物清单 ====="
-          Get-ChildItem $publish | ForEach-Object {
-            Write-Host ("  {0,-32} {1,10} bytes" -f $_.Name, $_.Length)
-          }
+          Get-ChildItem $publish | ForEach-Object { Write-Host ("  {0,-32} {1,10} bytes" -f $_.Name, $_.Length) }
 
-      - name: 生成使用说明
+      - name: 加入使用说明
         shell: pwsh
-        run: |
-          @"
-  mcboost PCL CE Hook
-  ===================
+        run: Copy-Item "pcl-hook/使用说明.txt" "publish/使用说明.txt"
 
-  作用：把 PCL CE 的单文件下载连接上限从 8 提升到 24（可配置）。
-        实测 8 连接 = 2.7 MB/s，24 连接 = 18.3 MB/s，约 6.8 倍。
-
-  文件：
-    PclHookInjector.exe   注入器
-    PclHook.dll           补丁本体
-    0Harmony.dll          Harmony 运行时（必需）
-
-  用法：
-    1. 先正常启动 PCL CE，等它完全加载完
-    2. 运行：
-         PclHookInjector.exe --process "Plain Craft Launcher 2" --connections 24
-    3. 看到 "注入完成" 即可，之后正常下载整合包
-
-  自定义连接数：
-    PclHookInjector.exe --process "Plain Craft Launcher 2" --connections 32
-
-  验证是否生效：
-    查看 %APPDATA%\PCL\mcboost-hook.log
-    出现 "已提升单文件连接上限至 24（原为 8）" 即成功。
-
-  还原：
-    重启 PCL CE 即可（补丁只在内存中，不修改任何文件）。
-
-  排错：
-    - "找不到进程"  → 确认 PCL CE 已启动，进程名是否一致
-                       （任务管理器 → 详细信息 里看）
-    - "重试 40 次后仍未找到" → PCL CE 版本已变，请提交 issue 并附上版本号
-    - 日志无输出 → 注入成功但补丁未命中，同上
-
-  注意：
-    - 注入器与 PCL CE 都必须是 64 位
-    - 这是内存补丁，PCL CE 升级后可能失效
-  "@ | Out-File -FilePath publish/使用说明.txt -Encoding utf8
-
-      - uses: actions/upload-artifact@v4
+      - name: 上传 DLL
+        uses: actions/upload-artifact@v4
         with:
           name: PclHook
           path: publish/
