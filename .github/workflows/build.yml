@@ -70,7 +70,9 @@ jobs:
           # 启动器：整个输出目录全拷。
           # 之前手动挑 .exe/.dll 漏掉了 runtimeconfig.json，
           # 缺它 .NET 应用根本起不来，Windows 会弹「要装 .NET」。
-          Get-ChildItem "pcl-hook/out/launcher" -File | ForEach-Object { Copy-Item $_.FullName $stage }
+          Get-ChildItem "pcl-hook/out/launcher" -File |
+            Where-Object { $_.Extension -ne ".pdb" } |
+            ForEach-Object { Copy-Item $_.FullName $stage }
 
           # 说明文件用 ASCII 名，避免 Compress-Archive 把中文名弄成乱码
           Copy-Item "pcl-hook/README.txt" (Join-Path $stage "README.txt") -ErrorAction SilentlyContinue
