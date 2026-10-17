@@ -46,9 +46,9 @@ public partial class MainWindow : Window
             var found = LocateExe();
             if (found != null)
             {
-                TxtExePath.Text = found.path;
-                Append($"已定位 PCL CE: {found.path}");
-                Append($"  （来源: {found.source}）");
+                TxtExePath.Text = found.Path;
+                Append($"已定位 PCL CE: {found.Path}");
+                Append($"  （来源: {found.Source}）");
             }
             else
             {
@@ -103,9 +103,9 @@ public partial class MainWindow : Window
             TxtDetectHint.Foreground = System.Windows.Media.Brushes.Orange;
             return;
         }
-        TxtExePath.Text = found.path;
-        SaveConfig(found.path);
-        Append($"自动检测到: {found.path}（来源: {found.source}）");
+        TxtExePath.Text = found.Path;
+        SaveConfig(found.Path);
+        Append($"自动检测到: {found.Path}（来源: {found.Source}）");
         TxtDetectHint.Text = "已保存";
         TxtDetectHint.Foreground = System.Windows.Media.Brushes.LightGreen;
     }
@@ -129,7 +129,7 @@ public partial class MainWindow : Window
                 Append("请先选择 PCL CE 主程序（点「浏览…」）");
                 return;
             }
-            exe = found.path;
+            exe = found.Path;
             TxtExePath.Text = exe;
             SaveConfig(exe);
         }
@@ -249,13 +249,13 @@ public partial class MainWindow : Window
     // 定位 PCL CE
     // ———————————————————————————————
 
-    private (string path, string source)? LocateExe(bool forceRediscover = false)
+    private LocatedExe? LocateExe(bool forceRediscover = false)
     {
         // 1. 已保存的路径
         if (!forceRediscover)
         {
             var saved = LoadConfig();
-            if (saved != null && File.Exists(saved)) return (saved, "上次选择的路径");
+            if (saved != null && File.Exists(saved)) return new LocatedExe(saved, "上次选择的路径");
         }
 
         // 2. 正在运行的进程 —— 最可靠
@@ -263,14 +263,14 @@ public partial class MainWindow : Window
         if (proc != null)
         {
             var p = SafeMainModulePath(proc);
-            if (p != null && File.Exists(p)) return (p, "运行中的进程");
+            if (p != null && File.Exists(p)) return new LocatedExe(p, "运行中的进程");
         }
 
         // 3. 与本程序同目录
         foreach (var n in ExeNames)
         {
             var c = Path.Combine(AppContext.BaseDirectory, n);
-            if (File.Exists(c)) return (c, "程序所在目录");
+            if (File.Exists(c)) return new LocatedExe(c, "程序所在目录");
         }
 
         // 4. 常见位置
@@ -319,7 +319,7 @@ public partial class MainWindow : Window
         if (hit != null)
         {
             SaveConfig(hit);
-            return (hit, "常见位置扫描");
+            return new LocatedExe(hit, "常见位置扫描");
         }
 
         return null;
@@ -398,4 +398,7 @@ public partial class MainWindow : Window
     {
         TxtLog.Text += $"[{DateTime.Now:HH:mm:ss}] {line}\n";
     }
+
+    /// <summary>定位结果。</summary>
+    private sealed record LocatedExe(string Path, string Source);
 }
