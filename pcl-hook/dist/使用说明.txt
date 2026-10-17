@@ -1,44 +1,71 @@
-mcboost PCL CE Hook
+mcboost PCL CE 加速
 ===================
 
-作用：把 PCL CE 的单文件下载连接上限从 8 提升到 24（可配置）。
-      PCL CE 源码里这是 const 硬编码：
+作用：把 PCL CE 的单文件下载连接上限从 8 提升到 24（可调）。
+      PCL CE 源码里这是 const 硬编码，改设置无效：
         public const int NetTaskSingleFileConnectionLimitMax = 8;
-      实测 8 连接 = 2.7 MB/s，24 连接 = 18.3 MB/s，约 6.8 倍。
+      实测同文件同时刻：8 连接 = 2.7 MB/s，24 连接 = 18.3 MB/s，约 6.8 倍。
 
-文件：
-  PclHookInjector.exe   注入器
-  PclHook.dll           补丁本体
-  0Harmony.dll          Harmony 运行时（必需，目标进程里没有）
+不修改任何下载源设置，不起常驻代理。只是在 PCL CE 进程内
+把连接上限抬高。你的 Modrinth / CurseForge 源照常工作。
 
-用法：
-  1. 先正常启动 PCL CE，等它完全加载完
-  2. 运行：
-       PclHookInjector.exe --process "Plain Craft Launcher 2" --connections 24
-  3. 看到 "注入完成" 即可，之后正常下载整合包
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-自定义连接数：
-  PclHookInjector.exe --process "Plain Craft Launcher 2" --connections 32
+文件
+  McBoostGui.exe          GUI 注入器（推荐，带自动注入）
+  PclHookInjector.exe     命令行注入器
+  PclHook.dll            补丁本体
+  0Harmony.dll           Harmony 运行时（必需，PCL CE 进程里没有）
+  PclHook.deps.json      依赖描述
 
-进程名不对时：
-  打开 任务管理器 → 详细信息，看 PCL CE 的实际进程名，
-  把 --process 后面的值换成它。
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-验证是否生效：
+用法一：GUI（推荐）
+  1. 先启动 PCL CE，等它完全加载完
+  2. 运行 McBoostGui.exe
+  3. 确认「目标进程」显示 MultiMc.exe，点「立即注入」
+  4. 日志出现「✓ 注入成功」即可
+
+  GUI 里勾选：
+    开机自动运行并自动注入   —— 以后每次 PCL CE 启动都会自动注入
+    检测到升级自动还原       —— PCL CE 升级后自动停止注入，恢复原版
+    启动到托盘               —— 不显示主窗口，只在后台待命
+
+用法二：命令行
+  PclHookInjector.exe --process MultiMc --connections 24
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+验证是否生效
   查看 %APPDATA%\PCL\mcboost-hook.log
-  出现 "已提升单文件连接上限至 24（原为 8）" 即成功。
+  出现「已提升单文件连接上限至 24（原为 8）」即成功。
 
-还原：
-  重启 PCL CE 即可（补丁只在内存中，不修改任何文件）。
+还原
+  重启 PCL CE 即可。补丁只在内存中，不修改任何文件。
 
-排错：
-  - "找不到进程"        → PCL CE 未启动，或进程名不对
-  - "重试 40 次后仍未找到" → PCL CE 版本已变，IL 模式没匹配上。
-                            请提交 issue 并附上 PCL CE 版本号。
-  - 日志无输出          → 注入成功但补丁未命中，同上
-  - PCL CE 崩溃         → 立即重启即可恢复；请提交 issue
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-注意：
-  - 注入器与 PCL CE 都必须是 64 位
-  - 这是内存补丁，PCL CE 升级后可能失效
-  - 只改了连接数上限，分段/慢连接恢复/进度上报仍用 PCL CE 自己的实现
+排错
+  「Invalid x64 DLL: wrong architecture: machine=0x14C」
+      → 说明用了旧版 DLL（32 位）。请用本版本（v0.2.0 起强制 x64）。
+
+  「OpenProcess 失败」→ 以管理员身份运行注入器。
+
+  「LoadLibraryA 在目标进程中返回 0」
+      → 检查 0Harmony.dll、PclHook.deps.json 是否与 PclHook.dll 同目录。
+
+  日志不存在 / 注入后毫无反应
+      → 说明托管代码没执行。请确认用的是 McBoostGui.exe 或
+        PclHookInjector.exe 注入，而不是第三方注入器（第三方注入器
+        只做 LoadLibrary，不会调用补丁的 Apply 方法）。
+
+  PCL CE 崩溃
+      → 重启 PCL CE 即完全恢复。请提 issue 并附上 PCL CE 版本号。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+注意
+  - 注入器、PclHook.dll、PCL CE 都必须 64 位
+  - 内存补丁，PCL CE 升级后可能失效；届时日志会写
+    「未找到连接数上限的 IL 模式」，且不会修改任何 IL，保持原版行为
+  - 进程名是 MultiMc.exe（不是 "Plain Craft Launcher 2"）
