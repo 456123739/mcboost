@@ -27,7 +27,7 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
-          include-prerelease: true
+          dotnet-quality: 'preview'
 
       - name: 编译 PclHook
         run: dotnet build pcl-hook/PclHook/PclHook.csproj -c Release -o pcl-hook/out/hook
