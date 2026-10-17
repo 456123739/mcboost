@@ -1,190 +1,311 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
-using System.Runtime.CompilerServices;
 using System.Threading;
 using HarmonyLib;
 
 namespace McBoost.PclHook
 {
     /// <summary>
-    /// 实际的补丁逻辑。
+    /// 补丁执行器。
     ///
-    /// <para><b>关键点一：目标是 async 状态机</b></para>
-    /// PCL CE 的 <c>AdaptiveRangeDownloader.DownloadAsync</c> 是 <c>private async Task</c>。
-    /// C# 编译器会把真正的 IL 放进生成的嵌套类型（&lt;&gt;d__X）的
-    /// <c>MoveNext()</c> 里，而 <c>DownloadAsync</c> 本身只是个壳。
-    /// 所以必须用 Harmony 的 <c>MethodType.Async</c> 打到 MoveNext，
-    /// 直接 patch DownloadAsync 永远匹配不到 Math.Clamp。
+    /// 重要教训：不要依赖具体的类型名。
+    /// 之前按 GitHub dev 分支源码写死了 PCL.Network.AdaptiveRangeDownloader，
+    /// 但用户实际安装的 PCL CE 发布版里**根本没有这个类**（35924 个类型扫完都没命中）。
+    /// 各版本之间下载器实现差异很大，写死类名必然失效。
     ///
-    /// <para><b>关键点二：等目标程序集加载</b></para>
-    /// 启动钩子在 Main() 之前执行，此时 PCL CE 自己的程序集还没加载。
-    /// 所以这里轮询等待，直到能找到 AdaptiveRangeDownloader 再 patch。
+    /// 现在的做法：**按 IL 特征匹配**。
+    /// 不管类叫什么、在哪个程序集，只要某个方法里出现
+    /// <code>Math.Clamp(?, 1, 8)</code>
+    /// 这个指令序列，就认定它是「限流单文件连接数」的地方，把上界 8 改成目标值。
     ///
-    /// <para><b>关键点三：只改一处常量</b></para>
-    /// 要改的是 <c>Math.Clamp(NetTaskSingleFileConnectionLimit, 1, 8)</c>
-    /// 里的上界 8。同一方法里还有 SlowCheckSeconds=8 等语义不同的常量，
-    /// 所以以 Clamp 调用为锚点向前回溯精确匹配，绝不盲替换。
+    /// 为什么这个特征可靠：
+    ///   1. Clamp(x, 1, 8) 这种「下界 1、上界 8」的写法在下载器里几乎只用于连接数限制
+    ///   2. 特征包含 ldc.i4.1 + ldc.i4.8 + call Clamp 三段，误伤概率极低
+    ///   3. 扫描范围限定在名字含 Download/Net/Http 的类型里，进一步收窄
     /// </summary>
     internal static class PatchRunner
     {
         internal static int TargetConnections =
             ReadIntFromEnv("MCBOOST_PCL_CONNECTIONS") ?? 24;
 
-        private const int MaxWaitSeconds = 120;
+        /// <summary>等待 PCL 主程序集加载的最长时间。</summary>
+        private const int MaxWaitSeconds = 60;
+
+        /// <summary>认为属于「网络/下载」的类型名关键字。</summary>
+        private static readonly string[] NetishKeywords =
+            { "Download", "Net", "Http", "Transfer", "Fetch", "Mirror" };
 
         internal static void RunUntilApplied()
         {
-            Diag.Log($"patcher start, target connections = {TargetConnections}");
+            Diag.Log($"patcher start, target = {TargetConnections}");
 
-            Type? downloaderType = null;
+            if (!WaitForPclAssemblies())
+            {
+                Diag.Log("FAIL: PCL 主程序集未在 60 秒内加载");
+                return;
+            }
+
+            var report = Discover();
+            Diag.Log(report);
+
+            var patched = PatchClampPatterns();
+            if (patched > 0)
+            {
+                Diag.Log($"DONE: 已修改 {patched} 处连接数上限 -> {TargetConnections}");
+            }
+            else
+            {
+                Diag.Log("FAIL: 未找到任何 Clamp(?,1,8) 特征，无法确定连接数限制位置");
+                Diag.Log("请把上面这段报告整个发到 issue，我能据此定位。");
+            }
+        }
+
+        /// <summary>等待 PCL 自己的程序集加载出来。</summary>
+        private static bool WaitForPclAssemblies()
+        {
             var deadline = DateTime.UtcNow.AddSeconds(MaxWaitSeconds);
-            var spinner = 0;
-
             while (DateTime.UtcNow < deadline)
             {
-                downloaderType = FindType("PCL.Network.AdaptiveRangeDownloader");
-                if (downloaderType != null) break;
+                if (PclAssemblies().Any()) return true;
+                Thread.Sleep(200);
+            }
+            return false;
+        }
 
-                // 每 ~3 秒记一次，避免日志刷屏
-                if (++spinner % 30 == 0)
+        /// <summary>
+        /// 找出属于 PCL 的程序集。
+        /// 依据：程序集名含 PCL / Plain Craft / MultiMc，或与入口程序集相同。
+        /// </summary>
+        private static List<Assembly> PclAssemblies()
+        {
+            var result = new List<Assembly>();
+            var entry = Assembly.GetEntryAssembly();
+
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try
                 {
-                    var asmCount = AppDomain.CurrentDomain.GetAssemblies().Length;
-                    Diag.Log($"waiting for AdaptiveRangeDownloader... (assemblies={asmCount})");
+                    var name = asm.GetName().Name ?? "";
+                    if (name.Contains("PCL") || name.Contains("Plain Craft")
+                        || name.Equals("MultiMc", StringComparison.OrdinalIgnoreCase))
+                    {
+                        result.Add(asm);
+                    }
+                    else if (entry != null && asm == entry)
+                    {
+                        result.Add(asm);
+                    }
                 }
-                Thread.Sleep(100);
+                catch { /* 忽略取不到名字的程序集 */ }
             }
+            return result.Distinct().ToList();
+        }
 
-            if (downloaderType == null)
+        /// <summary>
+        /// 安全地取出一个程序集的全部类型（含部分加载成功的）。
+        /// </summary>
+        private static Type[] SafeGetTypes(Assembly asm)
+        {
+            try { return asm.GetTypes(); }
+            catch (ReflectionTypeLoadException ex) { return ex.Types.Where(t => t != null).Select(t => t!).ToArray(); }
+            catch { return Array.Empty<Type>(); }
+        }
+
+        /// <summary>
+        /// 生成一次性诊断报告：PCL 程序集里与网络/下载相关的类型清单。
+        /// 一次跑完写进日志，避免反复刷屏。
+        /// </summary>
+        private static string Discover()
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("===== 诊断报告 =====");
+
+            var asms = PclAssemblies();
+            sb.AppendLine($"PCL 程序集 ({asms.Count}): " +
+                          string.Join(", ", asms.Select(a => { try { return a.GetName().Name; } catch { return "?"; } })));
+
+            var allTypes = asms.SelectMany(SafeGetTypes).ToArray();
+            sb.AppendLine($"类型总数: {allTypes.Length}");
+
+            // 1. 名字像下载器的类型
+            var netish = allTypes
+                .Where(t => NetishKeywords.Any(k =>
+                    (t.Name ?? "").IndexOf(k, StringComparison.OrdinalIgnoreCase) >= 0))
+                .Select(t => t.FullName)
+                .Where(n => n != null)
+                .Take(60)
+                .ToList();
+            sb.AppendLine($"含 Download/Net/Http 关键字的类型 ({netish.Count} 个，最多列 60): " +
+                          string.Join(", ", netish));
+
+            // 2. 任何叫 DownloadAsync 的方法（各版本可能在不同类里）
+            var dlAsync = allTypes
+                .SelectMany(t =>
+                {
+                    try
+                    {
+                        return t.GetMethods(BindingFlags.Instance | BindingFlags.Static
+                                            | BindingFlags.Public | BindingFlags.NonPublic)
+                            .Where(m => m.Name.Contains("Download", StringComparison.OrdinalIgnoreCase))
+                            .Select(m => $"{t.FullName}.{m.Name}");
+                    }
+                    catch { return Enumerable.Empty<string>(); }
+                })
+                .Distinct()
+                .Take(40)
+                .ToList();
+            sb.AppendLine($"名字含 Download 的方法 ({dlAsync.Count} 个，最多列 40): " +
+                          string.Join(", ", dlAsync));
+
+            // 3. ModNet 这类「连接数限制」的类型是否存在，静态属性当前值
+            foreach (var t in allTypes.Where(t => t.Name is "ModNet" or "NetManager" or "DlManager"))
             {
-                Diag.Log($"FAIL: AdaptiveRangeDownloader not found after {MaxWaitSeconds}s. " +
-                         "已加载程序集: " + LoadedAssemblyNames());
-                return;
+                sb.AppendLine($"--- {t.FullName} 的静态属性 ---");
+                try
+                {
+                    foreach (var p in t.GetProperties(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic))
+                    {
+                        string val;
+                        try { val = p.CanRead ? (p.GetValue(null)?.ToString() ?? "null") : "(不可读)"; }
+                        catch { val = "(读取失败)"; }
+                        sb.AppendLine($"    {p.Name} = {val}");
+                    }
+                }
+                catch (Exception ex) { sb.AppendLine("    读取失败: " + ex.Message); }
             }
 
-            Diag.Log($"found type: {downloaderType.FullName} in {downloaderType.Assembly.GetName().Name}");
+            sb.AppendLine("====================");
+            return sb.ToString();
+        }
 
-            MethodInfo? downloadAsync;
-            try
-            {
-                downloadAsync = downloaderType.GetMethod(
-                    "DownloadAsync",
-                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            }
-            catch (AmbiguousMatchException)
-            {
-                // 有重载时挑参数最多的那个
-                downloadAsync = downloaderType
-                    .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                    .Where(m => m.Name == "DownloadAsync")
-                    .OrderByDescending(m => m.GetParameters().Length)
-                    .FirstOrDefault();
-                Diag.Log("DownloadAsync 存在重载，已选参数最多的一个");
-            }
-
-            if (downloadAsync == null)
-            {
-                Diag.Log("FAIL: DownloadAsync not found. 方法列表: " +
-                         string.Join(", ", downloaderType.GetMethods(
-                             BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                             .Select(m => m.Name).Distinct()));
-                return;
-            }
-
-            // 抬高属性值（兜底，不依赖 IL 改写也能改善部分路径）
-            TryRaiseProperty();
-
+        /// <summary>
+        /// 扫描并修补所有 Clamp(?, 1, 8) 特征。
+        /// @returns 命中的方法数
+        /// </summary>
+        private static int PatchClampPatterns()
+        {
             var harmony = new Harmony("com.mcboost.pclhook");
             var transpiler = new HarmonyMethod(
                 typeof(PatchRunner).GetMethod(nameof(Transpile),
                     BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)!);
 
-            // async 方法的真实 IL 在编译器生成的状态机 MoveNext() 里。
-            // 直接 patch DownloadAsync 只会打到创建状态机的壳上，永远匹配不到 Math.Clamp。
-            // 这里用 AsyncStateMachineAttribute 精确定位 MoveNext，
-            // 不依赖 Harmony 的 MethodType 枚举，版本兼容性更好。
-            var targets = new List<(string name, MethodBase method)>();
+            var candidates = new List<MethodBase>();
+            var asms = PclAssemblies();
+            var allTypes = asms.SelectMany(SafeGetTypes);
 
-            var attr = downloadAsync.GetCustomAttribute<AsyncStateMachineAttribute>();
-            if (attr?.StateMachineType != null)
+            foreach (var t in allTypes)
             {
-                var moveNext = attr.StateMachineType.GetMethod("MoveNext",
-                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                if (moveNext != null)
+                // 只在「像网络/下载」的类型里找，避免全量扫描太慢
+                if (!NetishKeywords.Any(k =>
+                        (t.Name ?? "").IndexOf(k, StringComparison.OrdinalIgnoreCase) >= 0))
+                    continue;
+
+                MethodBase[] methods;
+                try
                 {
-                    Diag.Log($"async 状态机: {attr.StateMachineType.FullName}.MoveNext");
-                    targets.Add(("MoveNext(状态机)", moveNext));
+                    methods = t.GetMethods(BindingFlags.Instance | BindingFlags.Static
+                                           | BindingFlags.Public | BindingFlags.NonPublic
+                                           | BindingFlags.DeclaredOnly);
                 }
-                else
+                catch { continue; }
+
+                foreach (var m in methods)
                 {
-                    Diag.Log("状态机类型存在但找不到 MoveNext");
+                    if (m.IsAbstract || m.ContainsGenericParameters) continue;
+                    if (HasClamp18Pattern(m)) candidates.Add(m);
                 }
             }
-            else
+
+            if (candidates.Count == 0)
             {
-                Diag.Log("DownloadAsync 不是 async 方法（无状态机），直接 patch 本体");
+                Diag.Log("未在 Download/Net 类型中找到 Clamp(?,1,8)。");
+                return 0;
             }
 
-            // 兜底：本体也试一次
-            targets.Add(("DownloadAsync(本体)", downloadAsync));
+            Diag.Log($"找到 {candidates.Count} 个含 Clamp(?,1,8) 的方法: " +
+                     string.Join(", ", candidates.Select(c => $"{c.DeclaringType?.FullName}.{c.Name}")));
 
-            var patched = false;
-            foreach (var (name, method) in targets)
+            var patched = 0;
+            foreach (var m in candidates)
             {
                 try
                 {
-                    harmony.Patch(method, transpiler: transpiler);
-                    patched = true;
-                    Diag.Log($"OK: patch 已应用到 {name}");
-                    break;
+                    harmony.Patch(m, transpiler: transpiler);
+                    patched++;
                 }
                 catch (Exception ex)
                 {
-                    Diag.Log($"patch 失败 [{name}]: {ex.GetType().Name}: {ex.Message}");
+                    Diag.Log($"patch 失败 {m.DeclaringType?.Name}.{m.Name}: {ex.Message}");
                 }
             }
 
-            if (!patched)
-            {
-                Diag.Log("FAIL: 所有 patch 目标均失败");
-                return;
-            }
+            // 顺带抬高属性值（若存在）
+            TryRaiseConnectionProperty(allTypes);
 
-            Diag.Log($"DONE: PCL CE 单文件连接上限已改为 {TargetConnections}（原为 8）");
+            return patched;
         }
 
         /// <summary>
-        /// 尝试直接把静态属性改成目标值。对 const 内联无效，但能覆盖其它代码路径。
+        /// 判断方法 IL 里是否含 ldc.i4.1 ; ldc.i4.8 ; call Math.Clamp 序列。
         /// </summary>
-        private static void TryRaiseProperty()
+        private static bool HasClamp18Pattern(MethodBase m)
         {
             try
             {
-                var modNet = FindType("PCL.Network.ModNet");
-                if (modNet == null) { Diag.Log("ModNet 未找到（跳过属性设置）"); return; }
+                var body = m.GetMethodBody();
+                if (body == null) return false;
+                var il = body.GetILAsByteArray();
+                if (il == null || il.Length < 6) return false;
 
-                var prop = modNet.GetProperty("NetTaskSingleFileConnectionLimit",
-                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
-                if (prop?.CanWrite == true)
+                // 逐字节粗扫：ldc.i4.1 = 0x17，ldc.i4.8 = 0x1D
+                for (var i = 0; i + 3 < il.Length; i++)
                 {
-                    prop.SetValue(null, TargetConnections);
-                    Diag.Log($"ModNet.NetTaskSingleFileConnectionLimit 设为 {TargetConnections}");
-                }
-                else
-                {
-                    Diag.Log("NetTaskSingleFileConnectionLimit 不可写或不存在");
+                    if (il[i] != 0x17) continue;      // ldc.i4.1
+                    if (il[i + 1] != 0x1D) continue;  // ldc.i4.8
+                    // 下一条应是 call(0x28)/callvirt(0x6F)，紧跟着 4 字节 metadata token
+                    if (il[i + 2] != 0x28 && il[i + 2] != 0x6F) continue;
+                    return true;
                 }
             }
-            catch (Exception ex)
+            catch { /* 动态方法 / 无 IL 体 */ }
+            return false;
+        }
+
+        /// <summary>
+        /// 尝试把所有名字含 ConnectionLimit 的静态属性改成目标值。
+        /// 对 const 内联无效，但能覆盖走属性读的路径。
+        /// </summary>
+        private static void TryRaiseConnectionProperty(IEnumerable<Type> allTypes)
+        {
+            foreach (var t in allTypes)
             {
-                Diag.Log("设置属性失败: " + ex.Message);
+                PropertyInfo[] props;
+                try
+                {
+                    props = t.GetProperties(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                }
+                catch { continue; }
+
+                foreach (var p in props)
+                {
+                    if (!p.Name.Contains("Connection", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!p.CanWrite) continue;
+                    try
+                    {
+                        p.SetValue(null, TargetConnections);
+                        Diag.Log($"已设置 {t.Name}.{p.Name} = {TargetConnections}");
+                    }
+                    catch { /* 类型不匹配或只读，忽略 */ }
+                }
             }
         }
 
         /// <summary>
-        /// Transpiler：把 <c>Math.Clamp(x, 1, 8)</c> 的上界 8 换成目标值。
+        /// Transpiler：把 Clamp(?, 1, 8) 的上界 8 换成目标值。
         /// </summary>
         public static IEnumerable<CodeInstruction> Transpile(IEnumerable<CodeInstruction> instructions)
         {
@@ -198,71 +319,29 @@ namespace McBoost.PclHook
 
                 var third = list[i - 1];
                 var second = list[i - 2];
-                var first = list[i - 3];
 
                 if (!IsConst(second, 1)) continue;
                 if (!IsConst(third, 8)) continue;
-                if (!ReadsConnectionLimit(first)) continue;
 
                 SetConst(third, TargetConnections);
                 replaced++;
             }
 
             if (replaced > 0)
-            {
-                Diag.Log($"transpiler: 替换 {replaced} 处 Clamp 上界 -> {TargetConnections}");
-            }
+                Diag.Log($"transpiler: 替换 {replaced} 处 -> {TargetConnections}");
             else
-            {
-                Diag.Log("transpiler: 未匹配到 Clamp(x,1,8) 模式，转储实际 IL 以便排查");
-                DumpClampContext(list);
-            }
+                Diag.Log("transpiler: 该方法中未匹配到 Clamp(?,1,8)");
 
             return list;
         }
 
         /// <summary>
-        /// 把 Clamp 调用附近的 IL 打到日志里。
-        /// transpiler 没匹配上时用 —— 这样不必再靠猜，能直接看到真实指令序列。
-        /// </summary>
-        private static void DumpClampContext(List<CodeInstruction> list)
-        {
-            try
-            {
-                var found = 0;
-                for (var i = 0; i < list.Count && found < 3; i++)
-                {
-                    if (!IsClampCall(list[i])) continue;
-                    found++;
-
-                    var from = Math.Max(0, i - 6);
-                    var to = Math.Min(list.Count - 1, i + 1);
-                    var sb = new System.Text.StringBuilder();
-                    sb.Append($"Clamp@{i}: ");
-                    for (var k = from; k <= to; k++)
-                    {
-                        var ins = list[k];
-                        var operand = ins.operand == null ? "" : $" {ins.operand}";
-                        sb.Append($"[{k}]{(k == i ? "*" : "")}{ins.opcode.Name}{operand}  ");
-                    }
-                    Diag.Log(sb.ToString());
-                }
-                if (found == 0) Diag.Log("未在该方法中找到任何 Math.Clamp 调用");
-            }
-            catch (Exception ex)
-            {
-                Diag.Log("dump IL 失败: " + ex.Message);
-            }
-        }
-
-        /// <summary>
-        /// 判断指令是否为指定整数常量。
+        /// 判断是否为指定整数常量。
         ///
-        /// 必须处理三种编码方式，否则永远匹配不到：
-        ///   · -1..8 用专用指令 <c>Ldc_I4_M1</c> / <c>Ldc_I4_0</c> … <c>Ldc_I4_8</c>，
-        ///     **没有 operand**（C# 编译 1 和 8 就属于这种）
-        ///   · -128..127 用 <c>Ldc_I4_S</c>，operand 是 <b>sbyte</b> 而非 int
-        ///   · 其它用 <c>Ldc_I4</c>，operand 是 int
+        /// 必须处理三种编码，否则永远匹配不到：
+        ///   · -1..8 用专用指令 Ldc_I4_M1 / Ldc_I4_0 … Ldc_I4_8，**无 operand**
+        ///   · -128..127 用 Ldc_I4_S，operand 是 <b>sbyte</b> 而非 int
+        ///   · 其它用 Ldc_I4，operand 是 int
         /// </summary>
         private static bool IsConst(CodeInstruction ins, int value)
         {
@@ -281,9 +360,7 @@ namespace McBoost.PclHook
             return false;
         }
 
-        /// <summary>
-        /// 把一条指令改写为指定整数常量（opcode 与 operand 一起改）。
-        /// </summary>
+        /// <summary>把一条指令改写为指定整数常量（opcode 与 operand 一起改）。</summary>
         private static void SetConst(CodeInstruction ins, int value)
         {
             if (value >= -128 && value <= 127)
@@ -302,102 +379,8 @@ namespace McBoost.PclHook
         {
             if (ins.opcode != OpCodes.Call && ins.opcode != OpCodes.Callvirt) return false;
             if (ins.operand is not MethodInfo m) return false;
-            return m.Name == "Clamp"
-                   && m.DeclaringType != null
+            return m.Name == "Clamp" && m.DeclaringType != null
                    && (m.DeclaringType.FullName == "System.Math" || m.DeclaringType.Name == "Math");
-        }
-
-        private static bool ReadsConnectionLimit(CodeInstruction ins)
-        {
-            if (ins.opcode != OpCodes.Call && ins.opcode != OpCodes.Callvirt && ins.opcode != OpCodes.Ldsfld)
-                return false;
-            if (ins.operand is not MemberInfo m) return false;
-            return m.Name.Contains("NetTaskSingleFileConnectionLimit");
-        }
-
-        /// <summary>
-        /// 在所有已加载程序集中按全名或短名查找类型。
-        ///
-        /// 关键点：<c>Assembly.GetTypes()</c> 只要有一个类型加载失败就会抛
-        /// <see cref="ReflectionTypeLoadException"/>，但异常的 <c>Types</c> 属性里
-        /// **保留了成功加载的部分**。早期版本遇到异常直接跳过整个程序集，
-        /// 而 PCL CE 主程序集恰恰会因为缺少可选依赖而抛异常 ——
-        /// 结果就是永远找不到目标类型。这里必须用部分结果继续找。
-        /// </summary>
-        private static Type? FindType(string fullName)
-        {
-            var direct = Type.GetType(fullName);
-            if (direct != null) return direct;
-
-            var shortName = fullName.Split('.').Last();
-            var failedAssemblies = new List<string>();
-            var totalTypes = 0;
-
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                Type?[] types;
-                try
-                {
-                    types = asm.GetTypes();
-                }
-                catch (ReflectionTypeLoadException ex)
-                {
-                    // 保留能加载的那部分
-                    types = ex.Types;
-                    failedAssemblies.Add(asm.GetName().Name ?? "?");
-                }
-                catch (Exception)
-                {
-                    failedAssemblies.Add(asm.GetName().Name ?? "?");
-                    continue;
-                }
-
-                totalTypes += types.Length;
-
-                var exact = types.FirstOrDefault(t => t != null && t.FullName == fullName);
-                if (exact != null) return exact;
-
-                var byShort = types.FirstOrDefault(t => t != null && t.Name == shortName);
-                if (byShort != null)
-                {
-                    Diag.Log($"按短名命中: {byShort.FullName}（在 {asm.GetName().Name}）");
-                    return byShort;
-                }
-            }
-
-            Diag.Log($"FindType({fullName}) 未命中。扫描 {totalTypes} 个类型，" +
-                     $"部分加载失败的程序集({failedAssemblies.Count}): " +
-                     string.Join(", ", failedAssemblies.Take(8)));
-
-            // 最后兜底：按关键字模糊找，便于诊断真实类型名
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                Type?[] types;
-                try { types = asm.GetTypes(); }
-                catch (ReflectionTypeLoadException ex) { types = ex.Types; }
-                catch { continue; }
-
-                var near = types.Where(t => t != null &&
-                        (t.Name.Contains("AdaptiveRange") || t.Name.Contains("RangeDownload")))
-                    .Select(t => t!.FullName).Take(5).ToList();
-                if (near.Count > 0)
-                {
-                    Diag.Log("相近类型: " + string.Join(", ", near));
-                    break;
-                }
-            }
-            return null;
-        }
-
-        private static string LoadedAssemblyNames()
-        {
-            try
-            {
-                return string.Join(", ", AppDomain.CurrentDomain.GetAssemblies()
-                    .Select(a => { try { return a.GetName().Name; } catch { return "?"; } })
-                    .Distinct().Take(40));
-            }
-            catch { return "?"; }
         }
 
         private static int? ReadIntFromEnv(string name)
