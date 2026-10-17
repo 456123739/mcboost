@@ -50,6 +50,18 @@ namespace McBoost.PclHook
         {
             Diag.Log($"patcher start (v3.5, 目标每文件 {TargetChunks} 分片)");
 
+            // 记录 Harmony 实际加载的版本与位置 —— 之前误用了 net452 构建，
+            // 在 .NET 10 上导致 HarmonySharedState 静态构造崩溃，这类问题必须先看清版本。
+            try
+            {
+                var ha = typeof(Harmony).Assembly;
+                Diag.Log($"Harmony 程序集: {ha.GetName().Version} @ {ha.Location}");
+            }
+            catch (Exception ex)
+            {
+                Diag.Log("读取 Harmony 信息失败: " + ex.Message);
+            }
+
             var modNet = WaitForType("PCL.Network.ModNet");
             if (modNet != null) RaiseThreadLimit(modNet);
             else Diag.Log("WARN: 找不到 PCL.Network.ModNet（不影响分片补丁）");
@@ -86,7 +98,8 @@ namespace McBoost.PclHook
             }
             catch (Exception ex)
             {
-                Diag.Log($"FAIL: patch 失败: {ex.GetType().Name}: {ex.Message}");
+                Diag.Log("FAIL: patch 失败，完整异常链如下：");
+                Diag.Log(DescribeException(ex));
             }
         }
 
@@ -231,6 +244,29 @@ namespace McBoost.PclHook
                 if (byShort != null) return byShort;
             }
             return null;
+        }
+
+        /// <summary>
+        /// 把异常的完整链路（含 InnerException 与堆栈）格式化成可读文本。
+        /// 只看 ex.Message 会丢掉真正的根因 —— 例如
+        /// TypeInitializationException 的真实原因在 InnerException 里。
+        /// </summary>
+        private static string DescribeException(Exception ex)
+        {
+            var sb = new System.Text.StringBuilder();
+            var level = 0;
+            for (Exception? e = ex; e != null && level < 6; e = e.InnerException, level++)
+            {
+                sb.AppendLine($"  [{level}] {e.GetType().FullName}: {e.Message}");
+                if (level == 0 && e is TypeInitializationException tie && tie.TypeName != null)
+                    sb.AppendLine($"      初始化失败的类型: {tie.TypeName}");
+                if (level == 0 && !string.IsNullOrEmpty(e.StackTrace))
+                {
+                    var lines = e.StackTrace!.Split('\n');
+                    foreach (var l in lines.Take(5)) sb.AppendLine("      " + l.Trim());
+                }
+            }
+            return sb.ToString().TrimEnd();
         }
 
         private static int? ReadIntFromEnv(string name)

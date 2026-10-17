@@ -62,9 +62,27 @@ jobs:
 
           # 钩子
           Copy-Item "pcl-hook/out/hook/PclHook.dll" $stage
-          $harmony = Get-ChildItem "$env:USERPROFILE\.nuget\packages\lib.harmony" -Recurse -Filter "0Harmony.dll" -ErrorAction SilentlyContinue |
-                     Where-Object { $_.FullName -match "net452|netstandard2.0" } | Select-Object -First 1
-          if (-not $harmony) { throw "找不到 0Harmony.dll" }
+          # Harmony 必须用 net10.0 构建。
+          # 之前误用了 net452 版本，在 .NET 10 上加载会导致
+          # HarmonySharedState 静态构造抛 TypeInitializationException。
+          $harmonyRoot = "$env:USERPROFILE\.nuget\packages\lib.harmony"
+          $harmony = Get-ChildItem $harmonyRoot -Recurse -Filter "0Harmony.dll" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.FullName -match '\\lib\\net10\.0\\' } |
+                     Select-Object -First 1
+          if (-not $harmony) {
+            Write-Host "net10.0 版未找到，退回 net8.0 / netstandard2.0"
+            $harmony = Get-ChildItem $harmonyRoot -Recurse -Filter "0Harmony.dll" -ErrorAction SilentlyContinue |
+                       Where-Object { $_.FullName -match '\\lib\\net8\.0\\' } | Select-Object -First 1
+          }
+          if (-not $harmony) {
+            $harmony = Get-ChildItem $harmonyRoot -Recurse -Filter "0Harmony.dll" -ErrorAction SilentlyContinue |
+                       Where-Object { $_.FullName -match 'netstandard2\.0' } | Select-Object -First 1
+          }
+          if (-not $harmony) { throw "找不到适配 .NET 10 的 0Harmony.dll" }
+          if ($harmony.FullName -match 'net452|net4[0-9]|net3') {
+            throw "选到了 .NET Framework 版 Harmony（$($harmony.FullName)），在 .NET 10 上会崩溃"
+          }
+          Write-Host "Harmony: $($harmony.FullName)"
           Copy-Item $harmony.FullName $stage
 
           # 启动器：整个输出目录全拷。
