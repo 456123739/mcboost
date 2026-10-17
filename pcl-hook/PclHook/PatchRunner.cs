@@ -151,7 +151,7 @@ namespace McBoost.PclHook
             try
             {
                 var handle = method.MethodHandle;
-                if (handle == IntPtr.Zero) return false;
+                if (handle.Value == IntPtr.Zero) return false;
                 RuntimeHelpers.PrepareMethod(handle);
                 return true;
             }
