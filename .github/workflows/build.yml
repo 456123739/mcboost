@@ -94,9 +94,34 @@ jobs:
           Write-Host "===== 产物清单 ====="
           Get-ChildItem $publish | ForEach-Object { Write-Host ("  {0,-32} {1,10} bytes" -f $_.Name, $_.Length) }
 
-      - name: 加入使用说明
+      - name: 打包成单个 zip
         shell: pwsh
-        run: Copy-Item "pcl-hook/使用说明.txt" "publish/使用说明.txt"
+        run: |
+          $ErrorActionPreference = "Stop"
+          # 只保留必需文件，多余的一个不带：
+          #   McBoostGui.exe        GUI 注入器（唯一推荐入口）
+          #   PclHook.dll           补丁本体
+          #   0Harmony.dll          Harmony 运行时（必需）
+          #   PclHook.deps.json     让 .NET 解析到 Harmony
+          #   使用说明.txt
+          # 不打包命令行注入器与 .NET 自动生成的附属 dll —— 对用户是噪音。
+          $keep = @(
+            "publish/McBoostGui.exe",
+            "publish/PclHook.dll",
+            "publish/0Harmony.dll",
+            "publish/PclHook.deps.json",
+            "publish/使用说明.txt"
+          )
+          foreach ($f in $keep) {
+            if (-not (Test-Path $f)) { throw "缺少必需文件: $f" }
+          }
+          $stage = "stage"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          foreach ($f in $keep) { Copy-Item $f $stage }
+          Compress-Archive -Path "$stage/*" -DestinationPath "mcboost-pclhook.zip" -Force
+          Write-Host "===== 最终交付：单个 zip ====="
+          Get-Item "mcboost-pclhook.zip" | ForEach-Object { Write-Host ("  {0}  {1} KB" -f $_.Name, [math]::Round($_.Length/1KB,1)) }
+          Get-ChildItem $stage | ForEach-Object { Write-Host ("    ├─ {0}  {1} KB" -f $_.Name, [math]::Round($_.Length/1KB,1)) }
 
       - name: 上传 Artifact
         uses: actions/upload-artifact@v4
@@ -106,19 +131,10 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: 附加到 Release
+      - name: 附加到 Release（单个 zip）
         if: github.event_name == 'release'
         shell: pwsh
         run: |
-          $files = @(
-            "publish/McBoostGui.exe", "publish/PclHookInjector.exe",
-            "publish/PclHook.dll", "publish/0Harmony.dll",
-            "publish/PclHook.deps.json", "publish/使用说明.txt"
-          )
-          foreach ($f in $files) {
-            if (Test-Path $f) {
-              gh release upload "${{ github.event.release.tag_name }}" $f --repo "${{ github.repository }}" --clobber
-            }
-          }
+          gh release upload "${{ github.event.release.tag_name }}" "mcboost-pclhook.zip" --repo "${{ github.repository }}" --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
