@@ -67,12 +67,13 @@ jobs:
           if (-not $harmony) { throw "找不到 0Harmony.dll" }
           Copy-Item $harmony.FullName $stage
 
-          # 启动器
-          Copy-Item "pcl-hook/out/launcher/McBoostLauncher.exe" $stage
-          Get-ChildItem "pcl-hook/out/launcher" -Filter "*.dll" | ForEach-Object { Copy-Item $_.FullName $stage }
-          Get-ChildItem "pcl-hook/out/launcher" -Filter "*.json" | ForEach-Object { Copy-Item $_.FullName $stage }
+          # 启动器：整个输出目录全拷。
+          # 之前手动挑 .exe/.dll 漏掉了 runtimeconfig.json，
+          # 缺它 .NET 应用根本起不来，Windows 会弹「要装 .NET」。
+          Get-ChildItem "pcl-hook/out/launcher" -File | ForEach-Object { Copy-Item $_.FullName $stage }
 
-          Copy-Item "pcl-hook/使用说明.txt" $stage -ErrorAction SilentlyContinue
+          # 说明文件用 ASCII 名，避免 Compress-Archive 把中文名弄成乱码
+          Copy-Item "pcl-hook/README.txt" (Join-Path $stage "README.txt") -ErrorAction SilentlyContinue
 
           Write-Host "===== 打包内容 ====="
           Get-ChildItem $stage | ForEach-Object { Write-Host ("  {0,-34} {1,8} KB" -f $_.Name, [math]::Round($_.Length/1KB,1)) }

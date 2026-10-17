@@ -12,6 +12,8 @@
     <AssemblyName>McBoostLauncher</AssemblyName>
     <RootNamespace>McBoost.Launcher</RootNamespace>
     <LangVersion>latest</LangVersion>
+    <!-- 允许使用比编译时更高版本的运行时，避免用户装了更新版 10.x 反而跑不起来 -->
+    <RollForward>LatestMajor</RollForward>
   </PropertyGroup>
 
 </Project>
