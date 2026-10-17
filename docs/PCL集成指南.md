@@ -113,21 +113,65 @@ node bin/mcboost.js pack rso -o ~/.minecraft/versions
 
 ---
 
-## 五、方案三：替换 PCL CE 的下载器（实验性）
+## 五、方案三：DLL 注入突破连接上限（已构建，实验性）
 
-PCL CE 是 .NET 10 程序，可以注入托管 DLL。目标：
+### 下载
 
-- 替换 `AdaptiveRangeDownloader` 的分段参数，突破 8 连接上限
-- 或直接 hook `DownloadResourceManager` / `FileDownloader`
+GitHub Actions 自动构建，产物在 [Actions 页面](https://github.com/456123739/mcboost/actions) 的 Artifacts 里（`PclHook`）。
+本仓库 `pcl-hook/dist/` 也保留了一份快照。
 
-**风险（必须清楚）**：
-- PCL CE 每次更新都可能失效（方法签名、类型结构变化）
-- 崩溃风险高于前两种方案
-- 需要注入器与 PCL CE 运行在相同 .NET 运行时
+```
+PclHookInjector.exe   注入器
+PclHook.dll           补丁本体
+0Harmony.dll          Harmony 运行时（必需，目标进程里没有）
+```
 
-**建议**：先用方案一验证加速效果确实是你想要的量级，确认有价值后再决定是否投入这个成本。
+### 用法
 
-> 补充：我查过 PCL CE 的 `PCL.Core/IO/Download/` 下有一层 `IDlConnection` / `IDlWriter` / `NDlFactory` 抽象接口，看起来像扩展点，但**仓库里没有任何类实现它们** —— 是预留设计，不是活的插件系统。所以不能靠"实现接口"来接进去，仍然需要注入。
+```bash
+# 1. 先启动 PCL CE，等它完全加载完
+# 2. 注入（连接数可改）
+PclHookInjector.exe --process "Plain Craft Launcher 2" --connections 24
+```
+
+验证：看 `%APPDATA%\PCL\mcboost-hook.log`，出现「已提升单文件连接上限至 24（原为 8）」即成功。
+
+### 实现原理
+
+`ModNet.cs` 里：
+
+```csharp
+public const int NetTaskSingleFileConnectionLimitMax = 8;   // const → 编译期内联
+public static int NetTaskSingleFileConnectionLimit { get; set; } = 8;
+```
+
+`Max` 是 `const`，读取处已被编译期内联成字面量 `8`，所以**单纯改属性值无效**。
+`AdaptiveRangeDownloader.DownloadAsync` 里：
+
+```csharp
+var workerCount = Math.Min(segmentCount,
+    Math.Clamp(ModNet.NetTaskSingleFileConnectionLimit, 1,
+               ModNet.NetTaskSingleFileConnectionLimitMax));   // ← 内联成 ldc.i4.8
+```
+
+补丁用 Harmony 的 **Transpiler 精确改写这一处 IL**：以 `Math.Clamp` 调用为锚点向前回溯，只替换 `Clamp(x, 1, 8)` 中作为上界的那个常量 8。
+
+**为什么不"把所有值为 8 的常量都换掉"** —— 那样会误伤同一方法里语义完全不同的常量（如 `DownloadSession` 的 `SlowCheckSeconds = 8`），破坏慢连接恢复逻辑。锚点回溯保证只动目标那一个。
+
+其余逻辑（分段、慢连接恢复、进度上报、失败重试）**全部沿用 PCL CE 自己的实现**，行为最接近原版。
+
+另外：
+- DLL 一加载就自动执行补丁（`[ModuleInitializer]`），注入器不需要再往目标进程塞调用 stub
+- 找不到目标类型时会重试 40 次（注入可能早于 PCL CE 程序集加载），仍失败则写日志而非静默
+- 没匹配到 IL 模式时**不修改任何 IL**，保持原版行为，靠日志暴露问题
+
+### 风险（必须清楚）
+
+- PCL CE 每次更新都可能失效（IL 结构变化），届时会写「未找到连接数上限的 IL 模式」日志
+- 崩溃风险高于方案一/二；**崩溃后重启 PCL CE 即可完全恢复**（纯内存补丁，不改文件）
+- 注入器与 PCL CE 都必须 64 位
+
+> 关于 PCL CE 的 `PCL.Core/IO/Download/` 下那层 `IDlConnection` / `IDlWriter` / `NDlFactory` 抽象接口：看起来像扩展点，但**仓库里没有任何类实现它们** —— 是预留设计，不是活的插件系统。所以不能靠"实现接口"接进去，必须注入。
 
 ---
 

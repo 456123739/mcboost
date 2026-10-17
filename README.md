@@ -256,7 +256,7 @@ npm test        # 44 个测试
 - CurseForge 老整合包在**没有 API key** 时可能解析不全 —— 配一个免费 key 即可解决，或用 `待手动下载.txt` 手动补齐。
 - Fabric maven（`maven.fabricmc.net`）目前没有可用的国内镜像，Fabric 模组只能走官方源。
 - 给 PCL 用的加速代理需要 PCL 支持自定义下载源；部分版本的 PCL 对某些源类型不支持自定义，此时请用"独立安装"方式（`mcboost pack ... -o ~/.minecraft/versions`）。
-- **DLL 注入替换 PCL CE 下载器的方案尚未实现** —— PCL CE 没有公开插件 API（`PCL.Core/IO/Download/` 下虽有一层 `IDlConnection`/`NDlFactory` 抽象，但仓库里没有任何类实现它，是预留设计而非活的扩展点）。建议先用代理方案验证加速效果。
+- **DLL 注入方案已构建但属实验性** —— 用 Harmony Transpiler 精确改写 `AdaptiveRangeDownloader` 里内联的 `Clamp(x, 1, 8)`，突破单文件 8 连接上限。产物由 GitHub Actions 自动构建（见 `pcl-hook/dist/`）。PCL CE 升级后可能失效，届时日志会明确提示而非静默失败；崩溃后重启 PCL CE 即可完全恢复。
 
 ## License
 

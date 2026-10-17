@@ -1,0 +1,41 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v10.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v10.0": {
+      "PclHook/1.0.0": {
+        "dependencies": {
+          "Lib.Harmony": "2.3.3"
+        },
+        "runtime": {
+          "PclHook.dll": {}
+        }
+      },
+      "Lib.Harmony/2.3.3": {
+        "runtime": {
+          "lib/net8.0/0Harmony.dll": {
+            "assemblyVersion": "2.3.3.0",
+            "fileVersion": "2.3.3.0"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "PclHook/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "Lib.Harmony/2.3.3": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-qxO8d2q7luoY8mTfCStQFOgRSd3dWZSS0Ffi5nrjX4qFkZxEBAEvNh5b/ZejTl2kY0fJs62LmfRJkBBTeiuuyQ==",
+      "path": "lib.harmony/2.3.3",
+      "hashPath": "lib.harmony.2.3.3.nupkg.sha512"
+    }
+  }
+}
